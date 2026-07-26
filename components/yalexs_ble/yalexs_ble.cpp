@@ -399,8 +399,12 @@ void YaleXSBLE::connect_current_attempt_() {
     return;
   }
 
-  ESP_LOGD(TAG, "Connecting to lock for attempt %u/%u", this->current_attempt_ + 1,
-           this->operation_retries_ + 1);
+  this->current_connection_uses_gatt_cache_ = this->cached_gatt_handles_valid_();
+  this->parent()->set_connection_type(this->current_connection_uses_gatt_cache_ ? espbt::ConnectionType::V3_WITH_CACHE
+                                                                                : espbt::ConnectionType::V3_WITHOUT_CACHE);
+
+  ESP_LOGD(TAG, "Connecting to lock for attempt %u/%u using %s GATT handles", this->current_attempt_ + 1,
+           this->operation_retries_ + 1, this->current_connection_uses_gatt_cache_ ? "cached" : "discovered");
   this->ignore_next_disconnect_ = false;
   this->current_attempt_++;
   this->parent()->connect();
@@ -493,16 +497,6 @@ void YaleXSBLE::force_disconnect_(const char *reason) {
 
 void YaleXSBLE::reset_session_state_() {
   this->session_authenticated_ = false;
-  this->secure_read_handle_ = 0;
-  this->secure_write_handle_ = 0;
-  this->normal_read_handle_ = 0;
-  this->normal_write_handle_ = 0;
-  this->secure_read_properties_ = 0;
-  this->normal_read_properties_ = 0;
-  this->manufacturer_handle_ = 0;
-  this->model_handle_ = 0;
-  this->serial_handle_ = 0;
-  this->firmware_handle_ = 0;
   this->pending_cccd_handle_ = 0;
   this->pending_notify_handle_ = 0;
   this->pending_read_handle_ = 0;
@@ -522,8 +516,14 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
     case ESP_GATTC_OPEN_EVT:
       if (!this->parent()->check_addr(param->open.remote_bda))
         return;
-      if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN)
+      if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN) {
         this->retry_current_operation_("connection open failed");
+        return;
+      }
+      if (this->current_connection_uses_gatt_cache_) {
+        this->cancel_timeout("connect_timeout");
+        this->on_connected_(false);
+      }
       break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT:
@@ -534,7 +534,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
         return;
       }
       this->cancel_timeout("connect_timeout");
-      this->on_connected_();
+      this->on_connected_(true);
       break;
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
@@ -544,6 +544,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
       if (this->pending_notify_setup_ == NotifySetup::NONE)
         return;
       if (param->reg_for_notify.status != ESP_GATT_OK || param->reg_for_notify.handle != this->pending_notify_handle_) {
+        this->invalidate_gatt_cache_("register notify failed");
         this->retry_current_operation_("register notify failed");
         return;
       }
@@ -563,6 +564,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
         return;
       this->cancel_timeout("command_timeout");
       if (param->write.status != ESP_GATT_OK) {
+        this->invalidate_gatt_cache_("write notify descriptor failed");
         this->retry_current_operation_("write notify descriptor failed");
         return;
       }
@@ -612,6 +614,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
         return;
       this->cancel_timeout("command_timeout");
       if (param->read.status != ESP_GATT_OK) {
+        this->invalidate_gatt_cache_("read characteristic failed");
         this->retry_current_operation_("read characteristic failed");
         return;
       }
@@ -656,8 +659,8 @@ void YaleXSBLE::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
   }
 }
 
-void YaleXSBLE::on_connected_() {
-  ESP_LOGD(TAG, "Connected; resolving Yale GATT handles");
+void YaleXSBLE::on_connected_(bool services_discovered) {
+  ESP_LOGD(TAG, "Connected; %s Yale GATT handles", services_discovered ? "resolving" : "using cached");
   this->ignore_next_disconnect_ = false;
   this->node_state = espbt::ClientState::ESTABLISHED;
 
@@ -669,14 +672,20 @@ void YaleXSBLE::on_connected_() {
   conn_params.timeout = 400;
   esp_ble_gap_update_conn_params(&conn_params);
 
-  if (!this->resolve_handles_()) {
+  if (services_discovered && !this->resolve_handles_()) {
     this->retry_current_operation_("missing Yale characteristics");
+    return;
+  }
+  if (!services_discovered && !this->cached_gatt_handles_valid_()) {
+    this->invalidate_gatt_cache_("cached handles unavailable");
+    this->retry_current_operation_("cached Yale characteristics unavailable");
     return;
   }
   this->start_notify_(NotifySetup::SECURE);
 }
 
 bool YaleXSBLE::resolve_handles_() {
+  this->clear_gatt_handles_();
   uint8_t props = 0;
   if (!this->find_characteristic_handles_(COMMAND_SERVICE_UUID, SECURE_READ_CHARACTERISTIC, &this->secure_read_handle_,
                                           &this->secure_read_properties_)) {
@@ -714,13 +723,20 @@ bool YaleXSBLE::resolve_handles_() {
     ESP_LOGW(TAG, "Firmware characteristic not found");
     return false;
   }
+  if (!this->resolve_notify_descriptor_(this->secure_read_handle_, NotifySetup::SECURE, &this->secure_cccd_handle_))
+    return false;
+  if (!this->resolve_notify_descriptor_(this->normal_read_handle_, NotifySetup::NORMAL, &this->normal_cccd_handle_))
+    return false;
 
   ESP_LOGD(TAG,
            "Yale handles: secure_read=0x%04x props=0x%02x secure_write=0x%04x normal_read=0x%04x props=0x%02x "
-           "normal_write=0x%04x manufacturer=0x%04x model=0x%04x serial=0x%04x firmware=0x%04x",
+           "normal_write=0x%04x secure_cccd=0x%04x normal_cccd=0x%04x manufacturer=0x%04x model=0x%04x serial=0x%04x "
+           "firmware=0x%04x",
            this->secure_read_handle_, this->secure_read_properties_, this->secure_write_handle_,
            this->normal_read_handle_, this->normal_read_properties_, this->normal_write_handle_,
-           this->manufacturer_handle_, this->model_handle_, this->serial_handle_, this->firmware_handle_);
+           this->secure_cccd_handle_, this->normal_cccd_handle_, this->manufacturer_handle_, this->model_handle_,
+           this->serial_handle_, this->firmware_handle_);
+  this->gatt_handles_valid_ = true;
   return true;
 }
 
@@ -789,6 +805,55 @@ bool YaleXSBLE::find_characteristic_handle_any_service_(const espbt::ESPBTUUID &
   }
 }
 
+bool YaleXSBLE::resolve_notify_descriptor_(uint16_t char_handle, NotifySetup setup, uint16_t *descriptor_handle) {
+  esp_gattc_descr_elem_t desc_result;
+  uint16_t count = 1;
+  esp_gatt_status_t descr_status =
+      esp_ble_gattc_get_descr_by_char_handle(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), char_handle,
+                                             NOTIFY_DESC_UUID, &desc_result, &count);
+  if (descr_status != ESP_GATT_OK || count == 0) {
+    ESP_LOGW(TAG, "Notify descriptor lookup failed: status=%d count=%u char_handle=0x%04x setup=%s", descr_status, count,
+             char_handle, this->notify_setup_to_string_(setup));
+    return false;
+  }
+  *descriptor_handle = desc_result.handle;
+  ESP_LOGD(TAG, "Resolved %s CCCD: char=0x%04x cccd=0x%04x", this->notify_setup_to_string_(setup), char_handle,
+           desc_result.handle);
+  return true;
+}
+
+bool YaleXSBLE::cached_gatt_handles_valid_() const {
+  return this->gatt_handles_valid_ && this->secure_read_handle_ != 0 && this->secure_write_handle_ != 0 &&
+         this->normal_read_handle_ != 0 && this->normal_write_handle_ != 0 && this->secure_cccd_handle_ != 0 &&
+         this->normal_cccd_handle_ != 0 && this->manufacturer_handle_ != 0 && this->model_handle_ != 0 &&
+         this->serial_handle_ != 0 && this->firmware_handle_ != 0;
+}
+
+void YaleXSBLE::clear_gatt_handles_() {
+  this->gatt_handles_valid_ = false;
+  this->secure_read_handle_ = 0;
+  this->secure_write_handle_ = 0;
+  this->normal_read_handle_ = 0;
+  this->normal_write_handle_ = 0;
+  this->secure_read_properties_ = 0;
+  this->normal_read_properties_ = 0;
+  this->secure_cccd_handle_ = 0;
+  this->normal_cccd_handle_ = 0;
+  this->manufacturer_handle_ = 0;
+  this->model_handle_ = 0;
+  this->serial_handle_ = 0;
+  this->firmware_handle_ = 0;
+}
+
+void YaleXSBLE::invalidate_gatt_cache_(const char *reason) {
+  if (this->gatt_handles_valid_)
+    ESP_LOGW(TAG, "Invalidating cached Yale GATT handles: %s", reason);
+  this->clear_gatt_handles_();
+  this->current_connection_uses_gatt_cache_ = false;
+  if (this->parent() != nullptr)
+    this->parent()->set_connection_type(espbt::ConnectionType::V3_WITHOUT_CACHE);
+}
+
 void YaleXSBLE::start_notify_(NotifySetup setup) {
   const uint16_t handle = setup == NotifySetup::SECURE ? this->secure_read_handle_ : this->normal_read_handle_;
   ESP_LOGD(TAG, "Starting %s notify registration on handle 0x%04x", this->notify_setup_to_string_(setup), handle);
@@ -798,6 +863,7 @@ void YaleXSBLE::start_notify_(NotifySetup setup) {
   this->set_timeout("command_timeout", this->command_timeout_ms_, [this]() { this->handle_command_timeout_(); });
   esp_err_t err = esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), handle);
   if (err != ESP_OK) {
+    this->invalidate_gatt_cache_("notify registration call failed");
     ESP_LOGW(TAG, "Notify registration call failed: err=%d", err);
     this->retry_current_operation_("register notify call failed");
     return;
@@ -814,17 +880,18 @@ void YaleXSBLE::start_notify_(NotifySetup setup) {
 }
 
 bool YaleXSBLE::write_notify_descriptor_(uint16_t char_handle, NotifySetup setup) {
-  esp_gattc_descr_elem_t desc_result;
-  uint16_t count = 1;
-  esp_gatt_status_t descr_status =
-      esp_ble_gattc_get_descr_by_char_handle(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), char_handle,
-                                             NOTIFY_DESC_UUID, &desc_result, &count);
-  if (descr_status != ESP_GATT_OK || count == 0) {
-    ESP_LOGW(TAG, "Notify descriptor lookup failed: status=%d count=%u char_handle=0x%04x setup=%s", descr_status, count,
-             char_handle, this->notify_setup_to_string_(setup));
+  uint16_t descriptor_handle = setup == NotifySetup::SECURE ? this->secure_cccd_handle_ : this->normal_cccd_handle_;
+  if (descriptor_handle == 0 &&
+      !this->resolve_notify_descriptor_(char_handle, setup, &descriptor_handle)) {
+    this->invalidate_gatt_cache_("notify descriptor not found");
     this->retry_current_operation_("notify descriptor not found");
     return false;
   }
+  if (setup == NotifySetup::SECURE)
+    this->secure_cccd_handle_ = descriptor_handle;
+  else if (setup == NotifySetup::NORMAL)
+    this->normal_cccd_handle_ = descriptor_handle;
+
   const uint8_t properties = setup == NotifySetup::SECURE ? this->secure_read_properties_ : this->normal_read_properties_;
   uint16_t notify_en = 1;
   if ((properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0) {
@@ -835,18 +902,19 @@ bool YaleXSBLE::write_notify_descriptor_(uint16_t char_handle, NotifySetup setup
     ESP_LOGW(TAG, "Characteristic 0x%04x has no notify/indicate property bits set: props=0x%02x", char_handle,
              properties);
   }
-  this->pending_cccd_handle_ = desc_result.handle;
+  this->pending_cccd_handle_ = descriptor_handle;
   this->pending_notify_setup_ = setup;
   ESP_LOGD(TAG, "Writing %s CCCD: char=0x%04x cccd=0x%04x props=0x%02x value=%u",
-           this->notify_setup_to_string_(setup), char_handle, desc_result.handle, properties, notify_en);
+           this->notify_setup_to_string_(setup), char_handle, descriptor_handle, properties, notify_en);
   this->cancel_timeout("command_timeout");
   this->set_timeout("command_timeout", this->command_timeout_ms_, [this]() { this->handle_command_timeout_(); });
   esp_err_t err = esp_ble_gattc_write_char_descr(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
-                                                 desc_result.handle, sizeof(notify_en),
+                                                 descriptor_handle, sizeof(notify_en),
                                                  reinterpret_cast<uint8_t *>(&notify_en), ESP_GATT_WRITE_TYPE_RSP,
                                                  ESP_GATT_AUTH_REQ_NONE);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Notify descriptor write call failed: err=%d", err);
+    this->invalidate_gatt_cache_("notify descriptor write call failed");
     this->retry_current_operation_("write notify descriptor call failed");
     return false;
   }
@@ -994,8 +1062,10 @@ void YaleXSBLE::read_info_char_(StepType step, uint16_t handle) {
   this->set_timeout("command_timeout", this->command_timeout_ms_, [this]() { this->handle_command_timeout_(); });
   esp_err_t err = esp_ble_gattc_read_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
                                           ESP_GATT_AUTH_REQ_NONE);
-  if (err != ESP_OK)
+  if (err != ESP_OK) {
+    this->invalidate_gatt_cache_("read characteristic call failed");
     this->retry_current_operation_("read characteristic call failed");
+  }
 }
 
 void YaleXSBLE::handle_info_response_(StepType step, const uint8_t *data, uint16_t len) {
@@ -1085,6 +1155,7 @@ void YaleXSBLE::write_command_now_(ResponseChannel channel, uint16_t handle, std
       this->finish_operation_and_disconnect_();
       return;
     }
+    this->invalidate_gatt_cache_("write characteristic call failed");
     this->retry_current_operation_("write characteristic call failed");
   }
 }
@@ -1180,6 +1251,8 @@ void YaleXSBLE::handle_command_timeout_() {
   }
   if (this->active_step_ == StepType::BATTERY_STATUS)
     this->next_battery_attempt_ms_ = millis() + BATTERY_TIMEOUT_COOLDOWN_MS;
+  if (this->current_connection_uses_gatt_cache_)
+    this->invalidate_gatt_cache_("cached GATT command timeout");
   this->retry_current_operation_("command timeout");
 }
 

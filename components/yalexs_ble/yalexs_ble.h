@@ -200,11 +200,15 @@ class YaleXSBLE : public Component,
   void force_disconnect_(const char *reason);
   void reset_session_state_();
 
-  void on_connected_();
+  void on_connected_(bool services_discovered);
   bool resolve_handles_();
   bool find_characteristic_handles_(const espbt::ESPBTUUID &service_uuid, const espbt::ESPBTUUID &char_uuid,
                                     uint16_t *handle, uint8_t *properties);
   bool find_characteristic_handle_any_service_(const espbt::ESPBTUUID &char_uuid, uint16_t *handle);
+  bool resolve_notify_descriptor_(uint16_t char_handle, NotifySetup setup, uint16_t *descriptor_handle);
+  bool cached_gatt_handles_valid_() const;
+  void clear_gatt_handles_();
+  void invalidate_gatt_cache_(const char *reason);
   void start_notify_(NotifySetup setup);
   bool write_notify_descriptor_(uint16_t char_handle, NotifySetup setup);
   void begin_secure_handshake_();
@@ -302,6 +306,8 @@ class YaleXSBLE : public Component,
   uint16_t normal_write_handle_{0};
   uint8_t secure_read_properties_{0};
   uint8_t normal_read_properties_{0};
+  uint16_t secure_cccd_handle_{0};
+  uint16_t normal_cccd_handle_{0};
   uint16_t manufacturer_handle_{0};
   uint16_t model_handle_{0};
   uint16_t serial_handle_{0};
@@ -320,6 +326,8 @@ class YaleXSBLE : public Component,
   uint32_t operation_started_ms_{0};
   bool operation_steps_built_{false};
   bool ignore_next_disconnect_{false};
+  bool gatt_handles_valid_{false};
+  bool current_connection_uses_gatt_cache_{false};
 
   YaleLockInfo lock_info_;
   YaleBatteryState battery_;
