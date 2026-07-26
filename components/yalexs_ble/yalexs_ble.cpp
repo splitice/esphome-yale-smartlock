@@ -135,7 +135,7 @@ void YaleXSBLE::loop() {
 
   if (this->current_operation_ != OperationType::NONE &&
       millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
-    this->fail_current_operation_("operation timeout");
+    this->retry_current_operation_("operation timeout");
     return;
   }
 
@@ -225,6 +225,7 @@ uint16_t YaleXSBLE::get_homekit_state_num_(const std::vector<uint8_t> &data) con
 
 void YaleXSBLE::handle_advertisement_change_(const espbt::ESPBTDevice &device) {
   uint32_t next_update = 0;
+  bool saw_state_advertisement = false;
   const std::vector<uint8_t> *apple_data = nullptr;
   const std::vector<uint8_t> *yale_data = nullptr;
 
@@ -232,6 +233,7 @@ void YaleXSBLE::handle_advertisement_change_(const espbt::ESPBTDevice &device) {
       !apple_data->empty()) {
     const uint8_t first_byte = (*apple_data)[0];
     if (first_byte == HAP_FIRST_BYTE && apple_data->size() >= 13) {
+      saw_state_advertisement = true;
       const uint16_t hk_state = this->get_homekit_state_num_(*apple_data);
       if (this->last_hk_state_ == -1)
         next_update = FIRST_UPDATE_COALESCE_MS;
@@ -239,6 +241,7 @@ void YaleXSBLE::handle_advertisement_change_(const espbt::ESPBTDevice &device) {
         next_update = HK_UPDATE_COALESCE_MS;
       this->last_hk_state_ = hk_state;
     } else if (first_byte == HAP_ENCRYPTED_FIRST_BYTE) {
+      saw_state_advertisement = true;
       next_update = HK_UPDATE_COALESCE_MS;
     }
   }
@@ -247,18 +250,44 @@ void YaleXSBLE::handle_advertisement_change_(const espbt::ESPBTDevice &device) {
   if (this->get_manufacturer_u16_(device, YALE_MFR_ID, &yale_data) >= 0 && yale_data != nullptr &&
       (yale_data->size() == 1 || first_yale_adv)) {
     const uint8_t current_value = (*yale_data)[0];
+    const bool valid_yale_value = current_value == 0 || current_value == 1;
+    if (valid_yale_value)
+      saw_state_advertisement = true;
     if (next_update == 0) {
       if (first_yale_adv) {
         next_update = FIRST_UPDATE_COALESCE_MS;
-      } else if ((current_value == 0 || current_value == 1) && current_value != this->last_adv_value_) {
+      } else if (valid_yale_value && current_value != this->last_adv_value_) {
         next_update = ADV_UPDATE_COALESCE_MS;
       }
     }
     this->last_adv_value_ = current_value;
   }
 
+  if (next_update == 0 && saw_state_advertisement && this->needs_advertisement_retry_update_()) {
+    const uint32_t now = millis();
+    if (this->last_unknown_state_update_request_ms_ == 0 ||
+        now - this->last_unknown_state_update_request_ms_ >= UNKNOWN_STATE_ADV_RETRY_MS) {
+      ESP_LOGD(TAG, "State still unknown while advertisements are present; queueing authenticated update");
+      this->last_unknown_state_update_request_ms_ = now;
+      next_update = MANUAL_UPDATE_COALESCE_MS;
+    }
+  }
+
   if (next_update != 0)
     this->schedule_deferred_update_(next_update);
+}
+
+bool YaleXSBLE::needs_advertisement_retry_update_() const {
+  if (!this->lock_info_.valid)
+    return true;
+  if (this->lock_entity_ != nullptr && this->lock_status_ == YaleLockStatus::UNKNOWN)
+    return true;
+  if (this->lock_info_.door_sense() && (this->door_binary_sensor_ != nullptr || this->door_status_sensor_ != nullptr) &&
+      this->door_status_ == YaleDoorStatus::UNKNOWN)
+    return true;
+  if ((this->battery_level_sensor_ != nullptr || this->battery_voltage_sensor_ != nullptr) && !this->battery_.valid)
+    return true;
+  return false;
 }
 
 void YaleXSBLE::schedule_deferred_update_(uint32_t delay_ms) {
@@ -331,22 +360,18 @@ void YaleXSBLE::maybe_start_next_operation_() {
   this->current_operation_ = this->operation_queue_.front();
   this->operation_queue_.pop_front();
   this->current_attempt_ = 0;
-  this->operation_started_ms_ = millis();
   this->start_current_attempt_();
 }
 
 void YaleXSBLE::start_current_attempt_() {
   if (this->current_operation_ == OperationType::NONE)
     return;
-  if (millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
-    this->fail_current_operation_("operation timeout before attempt");
-    return;
-  }
   if (this->current_attempt_ > this->operation_retries_) {
     this->fail_current_operation_("retries exhausted");
     return;
   }
 
+  this->operation_started_ms_ = millis();
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
@@ -391,9 +416,12 @@ void YaleXSBLE::retry_current_operation_(const char *reason) {
   this->cancel_timeout("connect_timeout");
   this->cancel_timeout("command_timeout");
   this->cancel_timeout("cooldown");
+  this->cancel_timeout("notify_register_fallback");
+  this->cancel_timeout("retry_after_disconnect");
+  this->cancel_timeout("retry");
   this->force_disconnect_(reason);
 
-  if (this->current_attempt_ > this->operation_retries_ || millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
+  if (this->current_attempt_ > this->operation_retries_) {
     this->fail_current_operation_(reason);
     return;
   }
@@ -407,6 +435,9 @@ void YaleXSBLE::fail_current_operation_(const char *reason) {
   this->cancel_timeout("connect_timeout");
   this->cancel_timeout("command_timeout");
   this->cancel_timeout("cooldown");
+  this->cancel_timeout("notify_register_fallback");
+  this->cancel_timeout("retry");
+  this->cancel_timeout("retry_after_disconnect");
   this->force_disconnect_(reason);
   if (this->lock_entity_ != nullptr &&
       (this->current_operation_ == OperationType::LOCK || this->current_operation_ == OperationType::UNLOCK)) {
@@ -452,6 +483,7 @@ void YaleXSBLE::finish_operation_and_disconnect_() {
 
 void YaleXSBLE::force_disconnect_(const char *reason) {
   ESP_LOGD(TAG, "Disconnecting BLE client: %s", reason);
+  this->cancel_timeout("notify_register_fallback");
   this->reset_session_state_();
   if (this->parent() != nullptr && this->parent()->state() != espbt::ClientState::IDLE) {
     this->ignore_next_disconnect_ = true;
@@ -465,6 +497,8 @@ void YaleXSBLE::reset_session_state_() {
   this->secure_write_handle_ = 0;
   this->normal_read_handle_ = 0;
   this->normal_write_handle_ = 0;
+  this->secure_read_properties_ = 0;
+  this->normal_read_properties_ = 0;
   this->manufacturer_handle_ = 0;
   this->model_handle_ = 0;
   this->serial_handle_ = 0;
@@ -504,14 +538,27 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
       break;
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
+      ESP_LOGD(TAG, "Notify registration event: status=%d handle=0x%04x pending=0x%04x setup=%s",
+               param->reg_for_notify.status, param->reg_for_notify.handle, this->pending_notify_handle_,
+               this->notify_setup_to_string_(this->pending_notify_setup_));
+      if (this->pending_notify_setup_ == NotifySetup::NONE)
+        return;
       if (param->reg_for_notify.status != ESP_GATT_OK || param->reg_for_notify.handle != this->pending_notify_handle_) {
         this->retry_current_operation_("register notify failed");
+        return;
+      }
+      this->cancel_timeout("notify_register_fallback");
+      if (this->pending_cccd_handle_ != 0) {
+        ESP_LOGD(TAG, "Notify CCCD write already in progress; ignoring late registration event");
         return;
       }
       this->write_notify_descriptor_(this->pending_notify_handle_, this->pending_notify_setup_);
       break;
 
-    case ESP_GATTC_WRITE_DESCR_EVT:
+    case ESP_GATTC_WRITE_DESCR_EVT: {
+      ESP_LOGD(TAG, "Notify descriptor write event: status=%d conn_id=%d handle=0x%04x pending=0x%04x setup=%s",
+               param->write.status, param->write.conn_id, param->write.handle, this->pending_cccd_handle_,
+               this->notify_setup_to_string_(this->pending_notify_setup_));
       if (this->parent()->get_conn_id() != param->write.conn_id || param->write.handle != this->pending_cccd_handle_)
         return;
       this->cancel_timeout("command_timeout");
@@ -519,15 +566,18 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
         this->retry_current_operation_("write notify descriptor failed");
         return;
       }
-      if (this->pending_notify_setup_ == NotifySetup::SECURE) {
+      const NotifySetup completed_setup = this->pending_notify_setup_;
+      this->pending_cccd_handle_ = 0;
+      if (completed_setup == NotifySetup::SECURE) {
         this->pending_notify_setup_ = NotifySetup::NONE;
         this->begin_secure_handshake_();
-      } else if (this->pending_notify_setup_ == NotifySetup::NORMAL) {
+      } else if (completed_setup == NotifySetup::NORMAL) {
         this->pending_notify_setup_ = NotifySetup::NONE;
         this->session_authenticated_ = true;
         this->run_next_step_();
       }
       break;
+    }
 
     case ESP_GATTC_NOTIFY_EVT: {
       if (this->parent()->get_conn_id() != param->notify.conn_id)
@@ -575,6 +625,10 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
       if (!this->parent()->check_addr(param->disconnect.remote_bda))
         return;
       const bool shutdown_pending = this->active_step_ == StepType::SHUTDOWN;
+      this->cancel_timeout("connect_timeout");
+      this->cancel_timeout("command_timeout");
+      this->cancel_timeout("cooldown");
+      this->cancel_timeout("notify_register_fallback");
       this->reset_session_state_();
       if (this->ignore_next_disconnect_) {
         this->ignore_next_disconnect_ = false;
@@ -624,14 +678,50 @@ void YaleXSBLE::on_connected_() {
 
 bool YaleXSBLE::resolve_handles_() {
   uint8_t props = 0;
-  return this->find_characteristic_handles_(COMMAND_SERVICE_UUID, SECURE_READ_CHARACTERISTIC, &this->secure_read_handle_, &props) &&
-         this->find_characteristic_handles_(COMMAND_SERVICE_UUID, SECURE_WRITE_CHARACTERISTIC, &this->secure_write_handle_, &props) &&
-         this->find_characteristic_handles_(COMMAND_SERVICE_UUID, READ_CHARACTERISTIC, &this->normal_read_handle_, &props) &&
-         this->find_characteristic_handles_(COMMAND_SERVICE_UUID, WRITE_CHARACTERISTIC, &this->normal_write_handle_, &props) &&
-         this->find_characteristic_handle_any_service_(MANUFACTURER_NAME_CHARACTERISTIC, &this->manufacturer_handle_) &&
-         this->find_characteristic_handle_any_service_(MODEL_NUMBER_CHARACTERISTIC, &this->model_handle_) &&
-         this->find_characteristic_handle_any_service_(SERIAL_NUMBER_CHARACTERISTIC, &this->serial_handle_) &&
-         this->find_characteristic_handle_any_service_(FIRMWARE_REVISION_CHARACTERISTIC, &this->firmware_handle_);
+  if (!this->find_characteristic_handles_(COMMAND_SERVICE_UUID, SECURE_READ_CHARACTERISTIC, &this->secure_read_handle_,
+                                          &this->secure_read_properties_)) {
+    ESP_LOGW(TAG, "Secure read characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handles_(COMMAND_SERVICE_UUID, SECURE_WRITE_CHARACTERISTIC, &this->secure_write_handle_,
+                                          &props)) {
+    ESP_LOGW(TAG, "Secure write characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handles_(COMMAND_SERVICE_UUID, READ_CHARACTERISTIC, &this->normal_read_handle_,
+                                          &this->normal_read_properties_)) {
+    ESP_LOGW(TAG, "Normal read characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handles_(COMMAND_SERVICE_UUID, WRITE_CHARACTERISTIC, &this->normal_write_handle_,
+                                          &props)) {
+    ESP_LOGW(TAG, "Normal write characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handle_any_service_(MANUFACTURER_NAME_CHARACTERISTIC, &this->manufacturer_handle_)) {
+    ESP_LOGW(TAG, "Manufacturer characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handle_any_service_(MODEL_NUMBER_CHARACTERISTIC, &this->model_handle_)) {
+    ESP_LOGW(TAG, "Model characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handle_any_service_(SERIAL_NUMBER_CHARACTERISTIC, &this->serial_handle_)) {
+    ESP_LOGW(TAG, "Serial characteristic not found");
+    return false;
+  }
+  if (!this->find_characteristic_handle_any_service_(FIRMWARE_REVISION_CHARACTERISTIC, &this->firmware_handle_)) {
+    ESP_LOGW(TAG, "Firmware characteristic not found");
+    return false;
+  }
+
+  ESP_LOGD(TAG,
+           "Yale handles: secure_read=0x%04x props=0x%02x secure_write=0x%04x normal_read=0x%04x props=0x%02x "
+           "normal_write=0x%04x manufacturer=0x%04x model=0x%04x serial=0x%04x firmware=0x%04x",
+           this->secure_read_handle_, this->secure_read_properties_, this->secure_write_handle_,
+           this->normal_read_handle_, this->normal_read_properties_, this->normal_write_handle_,
+           this->manufacturer_handle_, this->model_handle_, this->serial_handle_, this->firmware_handle_);
+  return true;
 }
 
 bool YaleXSBLE::find_characteristic_handles_(const espbt::ESPBTUUID &service_uuid, const espbt::ESPBTUUID &char_uuid,
@@ -641,8 +731,10 @@ bool YaleXSBLE::find_characteristic_handles_(const espbt::ESPBTUUID &service_uui
   esp_bt_uuid_t service_id = service_uuid.get_uuid();
   esp_gatt_status_t service_status = esp_ble_gattc_get_service(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                                                                &service_id, &service_result, &service_count, 0);
-  if (service_status != ESP_GATT_OK || service_count == 0)
+  if (service_status != ESP_GATT_OK || service_count == 0) {
+    ESP_LOGD(TAG, "Service lookup failed: status=%d count=%u", service_status, service_count);
     return false;
+  }
 
   esp_gattc_char_elem_t char_result;
   uint16_t char_count = 1;
@@ -651,11 +743,16 @@ bool YaleXSBLE::find_characteristic_handles_(const espbt::ESPBTUUID &service_uui
       esp_ble_gattc_get_char_by_uuid(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                                      service_result.start_handle, service_result.end_handle, characteristic_id,
                                      &char_result, &char_count);
-  if (char_status != ESP_GATT_OK || char_count == 0)
+  if (char_status != ESP_GATT_OK || char_count == 0) {
+    ESP_LOGD(TAG, "Characteristic lookup failed: status=%d count=%u service_start=0x%04x service_end=0x%04x",
+             char_status, char_count, service_result.start_handle, service_result.end_handle);
     return false;
+  }
   *handle = char_result.char_handle;
   if (properties != nullptr)
     *properties = char_result.properties;
+  ESP_LOGD(TAG, "Resolved characteristic: handle=0x%04x props=0x%02x", char_result.char_handle,
+           char_result.properties);
   return true;
 }
 
@@ -666,10 +763,14 @@ bool YaleXSBLE::find_characteristic_handle_any_service_(const espbt::ESPBTUUID &
     uint16_t service_count = 1;
     esp_gatt_status_t service_status = esp_ble_gattc_get_service(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                                                                  nullptr, &service_result, &service_count, service_offset);
-    if (service_status == ESP_GATT_INVALID_OFFSET || service_status == ESP_GATT_NOT_FOUND || service_count == 0)
+    if (service_status == ESP_GATT_INVALID_OFFSET || service_status == ESP_GATT_NOT_FOUND || service_count == 0) {
+      ESP_LOGD(TAG, "Characteristic not found in any service: last_status=%d offset=%u", service_status, service_offset);
       return false;
-    if (service_status != ESP_GATT_OK)
+    }
+    if (service_status != ESP_GATT_OK) {
+      ESP_LOGD(TAG, "Service iteration failed: status=%d offset=%u", service_status, service_offset);
       return false;
+    }
 
     esp_gattc_char_elem_t char_result;
     uint16_t char_count = 1;
@@ -680,6 +781,8 @@ bool YaleXSBLE::find_characteristic_handle_any_service_(const espbt::ESPBTUUID &
                                        &char_result, &char_count);
     if (char_status == ESP_GATT_OK && char_count > 0) {
       *handle = char_result.char_handle;
+      ESP_LOGD(TAG, "Resolved info characteristic: handle=0x%04x props=0x%02x service_start=0x%04x service_end=0x%04x",
+               char_result.char_handle, char_result.properties, service_result.start_handle, service_result.end_handle);
       return true;
     }
     service_offset++;
@@ -688,12 +791,26 @@ bool YaleXSBLE::find_characteristic_handle_any_service_(const espbt::ESPBTUUID &
 
 void YaleXSBLE::start_notify_(NotifySetup setup) {
   const uint16_t handle = setup == NotifySetup::SECURE ? this->secure_read_handle_ : this->normal_read_handle_;
+  ESP_LOGD(TAG, "Starting %s notify registration on handle 0x%04x", this->notify_setup_to_string_(setup), handle);
   this->pending_notify_setup_ = setup;
   this->pending_notify_handle_ = handle;
+  this->pending_cccd_handle_ = 0;
   this->set_timeout("command_timeout", this->command_timeout_ms_, [this]() { this->handle_command_timeout_(); });
   esp_err_t err = esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), handle);
-  if (err != ESP_OK)
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Notify registration call failed: err=%d", err);
     this->retry_current_operation_("register notify call failed");
+    return;
+  }
+  this->set_timeout("notify_register_fallback", 300, [this, setup, handle]() {
+    if (this->current_operation_ == OperationType::NONE || this->pending_notify_setup_ != setup ||
+        this->pending_notify_handle_ != handle || this->pending_cccd_handle_ != 0) {
+      return;
+    }
+    ESP_LOGW(TAG, "Notify registration event did not arrive; writing CCCD directly for %s handle 0x%04x",
+             this->notify_setup_to_string_(setup), handle);
+    this->write_notify_descriptor_(handle, setup);
+  });
 }
 
 bool YaleXSBLE::write_notify_descriptor_(uint16_t char_handle, NotifySetup setup) {
@@ -703,18 +820,33 @@ bool YaleXSBLE::write_notify_descriptor_(uint16_t char_handle, NotifySetup setup
       esp_ble_gattc_get_descr_by_char_handle(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), char_handle,
                                              NOTIFY_DESC_UUID, &desc_result, &count);
   if (descr_status != ESP_GATT_OK || count == 0) {
+    ESP_LOGW(TAG, "Notify descriptor lookup failed: status=%d count=%u char_handle=0x%04x setup=%s", descr_status, count,
+             char_handle, this->notify_setup_to_string_(setup));
     this->retry_current_operation_("notify descriptor not found");
     return false;
   }
+  const uint8_t properties = setup == NotifySetup::SECURE ? this->secure_read_properties_ : this->normal_read_properties_;
   uint16_t notify_en = 1;
+  if ((properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0) {
+    notify_en = 1;
+  } else if ((properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) != 0) {
+    notify_en = 2;
+  } else {
+    ESP_LOGW(TAG, "Characteristic 0x%04x has no notify/indicate property bits set: props=0x%02x", char_handle,
+             properties);
+  }
   this->pending_cccd_handle_ = desc_result.handle;
   this->pending_notify_setup_ = setup;
+  ESP_LOGD(TAG, "Writing %s CCCD: char=0x%04x cccd=0x%04x props=0x%02x value=%u",
+           this->notify_setup_to_string_(setup), char_handle, desc_result.handle, properties, notify_en);
+  this->cancel_timeout("command_timeout");
   this->set_timeout("command_timeout", this->command_timeout_ms_, [this]() { this->handle_command_timeout_(); });
   esp_err_t err = esp_ble_gattc_write_char_descr(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                                                  desc_result.handle, sizeof(notify_en),
                                                  reinterpret_cast<uint8_t *>(&notify_en), ESP_GATT_WRITE_TYPE_RSP,
                                                  ESP_GATT_AUTH_REQ_NONE);
   if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Notify descriptor write call failed: err=%d", err);
     this->retry_current_operation_("write notify descriptor call failed");
     return false;
   }
@@ -750,7 +882,7 @@ void YaleXSBLE::run_next_step_() {
     return;
   }
   if (millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
-    this->fail_current_operation_("operation timeout");
+    this->retry_current_operation_("operation timeout");
     return;
   }
 
@@ -1035,6 +1167,12 @@ void YaleXSBLE::handle_normal_response_(std::vector<uint8_t> decrypted) {
 void YaleXSBLE::handle_unsolicited_normal_(const std::vector<uint8_t> &decrypted) { this->parse_state_response_(decrypted); }
 
 void YaleXSBLE::handle_command_timeout_() {
+  ESP_LOGW(TAG, "Command timeout: operation=%s attempt=%u/%u step=%s response=%s notify_setup=%s notify=0x%04x cccd=0x%04x",
+           this->operation_to_string_(this->current_operation_), this->current_attempt_, this->operation_retries_ + 1,
+           this->step_to_string_(this->active_step_),
+           this->response_channel_to_string_(this->pending_response_channel_),
+           this->notify_setup_to_string_(this->pending_notify_setup_), this->pending_notify_handle_,
+           this->pending_cccd_handle_);
   if (this->active_step_ == StepType::SHUTDOWN) {
     ESP_LOGD(TAG, "Secure shutdown timed out; disconnecting anyway");
     this->finish_operation_and_disconnect_();
@@ -1398,6 +1536,76 @@ const char *YaleXSBLE::door_status_to_string_(YaleDoorStatus status) const {
       return "unknown_04";
     default:
       return "unknown";
+  }
+}
+
+const char *YaleXSBLE::operation_to_string_(OperationType operation) const {
+  switch (operation) {
+    case OperationType::UPDATE:
+      return "update";
+    case OperationType::REFRESH_DOOR:
+      return "refresh_door";
+    case OperationType::LOCK:
+      return "lock";
+    case OperationType::UNLOCK:
+      return "unlock";
+    default:
+      return "none";
+  }
+}
+
+const char *YaleXSBLE::step_to_string_(StepType step) const {
+  switch (step) {
+    case StepType::READ_INFO_MANUFACTURER:
+      return "read_info_manufacturer";
+    case StepType::READ_INFO_MODEL:
+      return "read_info_model";
+    case StepType::READ_INFO_SERIAL:
+      return "read_info_serial";
+    case StepType::READ_INFO_FIRMWARE:
+      return "read_info_firmware";
+    case StepType::SECURE_AUTH_1:
+      return "secure_auth_1";
+    case StepType::SECURE_AUTH_2:
+      return "secure_auth_2";
+    case StepType::BATTERY_STATUS:
+      return "battery_status";
+    case StepType::DOOR_STATUS:
+      return "door_status";
+    case StepType::LOCK_STATUS:
+      return "lock_status";
+    case StepType::FORCE_LOCK:
+      return "force_lock";
+    case StepType::FORCE_UNLOCK:
+      return "force_unlock";
+    case StepType::SHUTDOWN:
+      return "shutdown";
+    default:
+      return "none";
+  }
+}
+
+const char *YaleXSBLE::notify_setup_to_string_(NotifySetup setup) const {
+  switch (setup) {
+    case NotifySetup::SECURE:
+      return "secure";
+    case NotifySetup::NORMAL:
+      return "normal";
+    default:
+      return "none";
+  }
+}
+
+const char *YaleXSBLE::response_channel_to_string_(ResponseChannel channel) const {
+  switch (channel) {
+    case ResponseChannel::SECURE_NOTIFY:
+      return "secure_notify";
+    case ResponseChannel::NORMAL_NOTIFY:
+      return "normal_notify";
+    case ResponseChannel::READ_CHAR:
+      return "read_char";
+    default:
+      return "none";
   }
 }
 

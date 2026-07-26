@@ -177,6 +177,7 @@ class YaleXSBLE : public Component,
   static constexpr uint32_t BATTERY_TIMEOUT_COOLDOWN_MS = 5UL * 60UL * 1000UL;
   static constexpr uint32_t REQUEST_COOLDOWN_MS = 250;
   static constexpr uint32_t IDLE_DISCONNECT_MS = 5100;
+  static constexpr uint32_t UNKNOWN_STATE_ADV_RETRY_MS = 30UL * 1000UL;
 
   bool matches_device_(const espbt::ESPBTDevice &device);
   void publish_last_seen_(const espbt::ESPBTDevice &device);
@@ -184,6 +185,7 @@ class YaleXSBLE : public Component,
   int32_t get_manufacturer_u16_(const espbt::ESPBTDevice &device, uint16_t manufacturer_id,
                                 const std::vector<uint8_t> **data) const;
   uint16_t get_homekit_state_num_(const std::vector<uint8_t> &data) const;
+  bool needs_advertisement_retry_update_() const;
 
   void schedule_deferred_update_(uint32_t delay_ms);
   void queue_operation_(OperationType operation);
@@ -261,6 +263,10 @@ class YaleXSBLE : public Component,
   bool is_jammed_state_(YaleLockStatus status) const;
   const char *lock_status_to_string_(YaleLockStatus status) const;
   const char *door_status_to_string_(YaleDoorStatus status) const;
+  const char *operation_to_string_(OperationType operation) const;
+  const char *step_to_string_(StepType step) const;
+  const char *notify_setup_to_string_(NotifySetup setup) const;
+  const char *response_channel_to_string_(ResponseChannel channel) const;
 
   YaleXSBLELock *lock_entity_{nullptr};
   YaleXSBLERefreshButton *refresh_button_{nullptr};
@@ -294,6 +300,8 @@ class YaleXSBLE : public Component,
   uint16_t secure_write_handle_{0};
   uint16_t normal_read_handle_{0};
   uint16_t normal_write_handle_{0};
+  uint8_t secure_read_properties_{0};
+  uint8_t normal_read_properties_{0};
   uint16_t manufacturer_handle_{0};
   uint16_t model_handle_{0};
   uint16_t serial_handle_{0};
@@ -333,6 +341,7 @@ class YaleXSBLE : public Component,
   uint32_t last_operation_complete_ms_{0};
   uint32_t next_battery_attempt_ms_{0};
   uint32_t last_notify_ms_{0};
+  uint32_t last_unknown_state_update_request_ms_{0};
 };
 
 }  // namespace esphome::yalexs_ble
