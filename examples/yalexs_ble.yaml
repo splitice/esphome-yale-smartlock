@@ -1,0 +1,54 @@
+esphome:
+  name: yalexs-ble-example
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: "test-network"
+  password: "test-password"
+
+api:
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+    continuous: true
+
+ble_client:
+  - id: yale_ble_client
+    mac_address: AA:BB:CC:DD:EE:FF
+    auto_connect: false
+
+yalexs_ble:
+  id: front_door_yale
+  ble_client_id: yale_ble_client
+  local_name: "AB12345"
+  key: "00112233445566778899aabbccddeeff"
+  slot: 1
+
+  lock:
+    name: Front Door Lock
+  refresh_door_status:
+    name: Front Door Refresh Door Status
+  door:
+    name: Front Door
+  door_status:
+    name: Front Door Status
+  last_seen_broadcast:
+    name: Front Door Last Broadcast
+  battery_level:
+    name: Front Door Battery
+  battery_voltage:
+    name: Front Door Battery Voltage
+  rssi:
+    name: Front Door RSSI

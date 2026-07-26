@@ -1,0 +1,6 @@
+.esphome/
+examples/.esphome/
+secrets.yaml
+examples/secrets.yaml
+__pycache__/
+*.py[cod]

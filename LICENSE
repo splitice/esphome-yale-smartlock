@@ -1,0 +1,12 @@
+SPDX-License-Identifier: GPL-3.0-only
+
+This project is licensed under the GNU General Public License v3.0 only.
+
+The Yale XS BLE protocol implementation is derived from the GPL-3.0-only
+`yalexs-ble` project, version 3.2.4:
+
+  https://github.com/bdraco/yalexs-ble
+
+See the GNU GPL v3.0 license text at:
+
+  https://www.gnu.org/licenses/gpl-3.0.txt
