@@ -324,6 +324,7 @@ class YaleXSBLE : public Component,
   OperationType current_operation_{OperationType::NONE};
   uint8_t current_attempt_{0};
   uint32_t operation_started_ms_{0};
+  bool retry_pending_{false};
   bool operation_steps_built_{false};
   bool ignore_next_disconnect_{false};
   bool gatt_handles_valid_{false};

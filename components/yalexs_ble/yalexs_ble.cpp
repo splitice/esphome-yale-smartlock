@@ -133,7 +133,7 @@ void YaleXSBLE::loop() {
     return;
   }
 
-  if (this->current_operation_ != OperationType::NONE &&
+  if (this->current_operation_ != OperationType::NONE && !this->retry_pending_ &&
       millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
     this->retry_current_operation_("operation timeout");
     return;
@@ -371,6 +371,9 @@ void YaleXSBLE::start_current_attempt_() {
     return;
   }
 
+  this->retry_pending_ = false;
+  // Count the whole attempt, including waiting for the previous connection to close.
+  this->current_attempt_++;
   this->operation_started_ms_ = millis();
   this->operation_steps_built_ = false;
   this->steps_.clear();
@@ -388,7 +391,7 @@ void YaleXSBLE::start_current_attempt_() {
 }
 
 void YaleXSBLE::connect_current_attempt_() {
-  if (this->current_operation_ == OperationType::NONE)
+  if (this->current_operation_ == OperationType::NONE || this->retry_pending_)
     return;
   if (this->parent() == nullptr) {
     this->fail_current_operation_("missing ble_client parent");
@@ -403,10 +406,9 @@ void YaleXSBLE::connect_current_attempt_() {
   this->parent()->set_connection_type(this->current_connection_uses_gatt_cache_ ? espbt::ConnectionType::V3_WITH_CACHE
                                                                                 : espbt::ConnectionType::V3_WITHOUT_CACHE);
 
-  ESP_LOGD(TAG, "Connecting to lock for attempt %u/%u using %s GATT handles", this->current_attempt_ + 1,
+  ESP_LOGD(TAG, "Connecting to lock for attempt %u/%u using %s GATT handles", this->current_attempt_,
            this->operation_retries_ + 1, this->current_connection_uses_gatt_cache_ ? "cached" : "discovered");
   this->ignore_next_disconnect_ = false;
-  this->current_attempt_++;
   this->parent()->connect();
   this->set_timeout("connect_timeout", this->connect_timeout_ms_, [this]() {
     this->retry_current_operation_("connect timeout");
@@ -414,8 +416,11 @@ void YaleXSBLE::connect_current_attempt_() {
 }
 
 void YaleXSBLE::retry_current_operation_(const char *reason) {
-  if (this->current_operation_ == OperationType::NONE)
+  if (this->current_operation_ == OperationType::NONE || this->retry_pending_)
     return;
+  // Disarm the expired attempt before disconnecting. Otherwise loop() keeps
+  // replacing the retry timer, so its callback never gets a chance to run.
+  this->retry_pending_ = true;
   ESP_LOGW(TAG, "Attempt failed: %s", reason);
   this->cancel_timeout("connect_timeout");
   this->cancel_timeout("command_timeout");
@@ -448,6 +453,7 @@ void YaleXSBLE::fail_current_operation_(const char *reason) {
     this->publish_lock_state_();
   }
   this->current_operation_ = OperationType::NONE;
+  this->retry_pending_ = false;
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
@@ -474,6 +480,7 @@ void YaleXSBLE::finish_operation_and_disconnect_() {
   this->last_operation_complete_ms_ = now;
 
   this->current_operation_ = OperationType::NONE;
+  this->retry_pending_ = false;
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
@@ -660,6 +667,8 @@ void YaleXSBLE::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
 }
 
 void YaleXSBLE::on_connected_(bool services_discovered) {
+  if (this->current_operation_ == OperationType::NONE || this->retry_pending_ || this->ignore_next_disconnect_)
+    return;
   ESP_LOGD(TAG, "Connected; %s Yale GATT handles", services_discovered ? "resolving" : "using cached");
   this->ignore_next_disconnect_ = false;
   this->node_state = espbt::ClientState::ESTABLISHED;
