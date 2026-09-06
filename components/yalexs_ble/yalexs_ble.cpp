@@ -180,7 +180,11 @@ void YaleXSBLE::publish_last_seen_(const espbt::ESPBTDevice &device) {
 
   std::string message = "address=" + device.address_str();
   message += ", name=";
-  message += device.get_name().empty() ? "(none)" : device.get_name();
+  const auto &name = device.get_name();
+  if (name.empty())
+    message += "(none)";
+  else
+    message.append(name.begin(), name.end());
   message += ", rssi=" + str_sprintf("%d", device.get_rssi());
   message += ", mfr=";
 
