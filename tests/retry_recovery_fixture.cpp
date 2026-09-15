@@ -24,7 +24,14 @@ struct Client {
   auto state() const { return state_; }
   void set_connection_type(espbt::ConnectionType) {}
   void connect() { connects++; state_ = espbt::ClientState::CONNECTING; }
-  void disconnect() { disconnects++; state_ = espbt::ClientState::DISCONNECTING; }
+  void disconnect() {
+    disconnects++;
+    // ESPHome cannot actively disconnect until CONNECT_EVT supplies a conn_id.
+    // A disconnect requested while CONNECTING is only remembered by the real
+    // client, whose state stays CONNECTING until the stack reports completion.
+    if (state_ != espbt::ClientState::CONNECTING)
+      state_ = espbt::ClientState::DISCONNECTING;
+  }
 };
 class YaleXSBLE {
  public:
@@ -105,10 +112,32 @@ int main(int argc, char **argv) {
   }
   assert(yale.timers.at("retry").due == due);
   assert(yale.client.disconnects == disconnects);
+  if (test == "connecting") {
+    yale.operation_timeout_ms_ = 1000;
+    yale.advance(150);
+    assert(yale.current_attempt_ == 1);
+    assert(yale.client.connects == 1);
+    assert(yale.timers.count("retry_after_disconnect") == 1);
+    yale.advance(250);
+    assert(yale.current_attempt_ == 1);
+    assert(yale.client.connects == 1);
+    yale.client.state_ = espbt::ClientState::IDLE;
+    yale.advance(250);
+    assert(yale.current_attempt_ == 2);
+    assert(yale.client.connects == 2);
+    return 0;
+  }
   if (test != "disconnect") yale.client.state_ = espbt::ClientState::IDLE;
   yale.advance(150);
-  assert(yale.current_attempt_ == 2);
-  assert(yale.client.connects == (test == "disconnect" ? 1U : 2U));
+  if (test == "disconnect") {
+    assert(yale.failures == 1);
+    assert(yale.current_attempt_ == 1);
+    assert(yale.client.connects == 1);
+    assert(yale.current_operation_ == YaleXSBLE::OperationType::NONE);
+  } else {
+    assert(yale.current_attempt_ == 2);
+    assert(yale.client.connects == 2);
+  }
   yale.advance(101);
   assert(yale.failures == 1);
   assert(yale.current_operation_ == YaleXSBLE::OperationType::NONE);

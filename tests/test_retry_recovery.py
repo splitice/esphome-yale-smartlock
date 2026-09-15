@@ -67,8 +67,11 @@ class RetryRecoveryTest(unittest.TestCase):
     def test_duplicate_failure_does_not_postpone_retry(self):
         self.run_case("duplicate")
 
-    def test_stuck_disconnect_exhausts_retries_and_queue_recovers(self):
+    def test_stuck_disconnect_times_out_and_queue_recovers(self):
         self.run_case("disconnect")
+
+    def test_retry_waits_for_connecting_client_to_become_idle(self):
+        self.run_case("connecting")
 
     def test_zero_retries_fails_once(self):
         self.run_case("zero")

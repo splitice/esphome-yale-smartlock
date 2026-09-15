@@ -325,6 +325,8 @@ class YaleXSBLE : public Component,
   uint8_t current_attempt_{0};
   uint32_t operation_started_ms_{0};
   bool retry_pending_{false};
+  bool waiting_for_ble_idle_{false};
+  uint32_t ble_idle_wait_started_ms_{0};
   bool operation_steps_built_{false};
   bool ignore_next_disconnect_{false};
   bool gatt_handles_valid_{false};

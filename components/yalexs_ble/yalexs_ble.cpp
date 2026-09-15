@@ -375,8 +375,29 @@ void YaleXSBLE::start_current_attempt_() {
     return;
   }
 
+  // ESPHome cannot cancel a connection until ESP-IDF assigns it a connection
+  // ID. In that case disconnect() only records the request and the client stays
+  // CONNECTING until the eventual OPEN/DISCONNECT events arrive. Do not consume
+  // another attempt or call connect() again while that previous attempt is
+  // still being settled.
+  if (this->parent() != nullptr && this->parent()->state() != espbt::ClientState::IDLE) {
+    this->retry_pending_ = true;
+    if (!this->waiting_for_ble_idle_) {
+      this->waiting_for_ble_idle_ = true;
+      this->ble_idle_wait_started_ms_ = millis();
+      this->force_disconnect_("waiting for idle before attempt");
+    }
+    if (millis() - this->ble_idle_wait_started_ms_ > this->operation_timeout_ms_) {
+      this->fail_current_operation_("BLE client did not become idle");
+      return;
+    }
+    this->set_timeout("retry_after_disconnect", 250, [this]() { this->start_current_attempt_(); });
+    return;
+  }
+
+  this->waiting_for_ble_idle_ = false;
   this->retry_pending_ = false;
-  // Count the whole attempt, including waiting for the previous connection to close.
+  // Count an attempt only when a new connection can actually be started.
   this->current_attempt_++;
   this->operation_started_ms_ = millis();
   this->operation_steps_built_ = false;
@@ -384,12 +405,6 @@ void YaleXSBLE::start_current_attempt_() {
   this->active_step_ = StepType::NONE;
   this->pending_response_channel_ = ResponseChannel::NONE;
   this->reset_session_state_();
-
-  if (this->parent() != nullptr && this->parent()->state() != espbt::ClientState::IDLE) {
-    this->force_disconnect_("fresh attempt");
-    this->set_timeout("retry_after_disconnect", 250, [this]() { this->connect_current_attempt_(); });
-    return;
-  }
 
   this->connect_current_attempt_();
 }
@@ -401,8 +416,8 @@ void YaleXSBLE::connect_current_attempt_() {
     this->fail_current_operation_("missing ble_client parent");
     return;
   }
-  if (this->parent()->state() == espbt::ClientState::DISCONNECTING) {
-    this->set_timeout("retry_after_disconnect", 250, [this]() { this->connect_current_attempt_(); });
+  if (this->parent()->state() != espbt::ClientState::IDLE) {
+    this->set_timeout("retry_after_disconnect", 250, [this]() { this->start_current_attempt_(); });
     return;
   }
 
@@ -432,6 +447,9 @@ void YaleXSBLE::retry_current_operation_(const char *reason) {
   this->cancel_timeout("notify_register_fallback");
   this->cancel_timeout("retry_after_disconnect");
   this->cancel_timeout("retry");
+  this->waiting_for_ble_idle_ =
+      this->parent() != nullptr && this->parent()->state() != espbt::ClientState::IDLE;
+  this->ble_idle_wait_started_ms_ = millis();
   this->force_disconnect_(reason);
 
   if (this->current_attempt_ > this->operation_retries_) {
@@ -458,6 +476,7 @@ void YaleXSBLE::fail_current_operation_(const char *reason) {
   }
   this->current_operation_ = OperationType::NONE;
   this->retry_pending_ = false;
+  this->waiting_for_ble_idle_ = false;
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
@@ -485,6 +504,7 @@ void YaleXSBLE::finish_operation_and_disconnect_() {
 
   this->current_operation_ = OperationType::NONE;
   this->retry_pending_ = false;
+  this->waiting_for_ble_idle_ = false;
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
