@@ -200,6 +200,7 @@ class YaleXSBLE : public Component,
   void force_disconnect_(const char *reason);
   void reset_session_state_();
 
+  void request_aggressive_connection_params_();
   void on_connected_(bool services_discovered);
   bool resolve_handles_();
   bool find_characteristic_handles_(const espbt::ESPBTUUID &service_uuid, const espbt::ESPBTUUID &char_uuid,
@@ -331,6 +332,9 @@ class YaleXSBLE : public Component,
   bool ignore_next_disconnect_{false};
   bool gatt_handles_valid_{false};
   bool current_connection_uses_gatt_cache_{false};
+  bool preempt_current_poll_{false};
+  bool session_shutting_down_{false};
+  bool aggressive_conn_params_requested_{false};
 
   YaleLockInfo lock_info_;
   YaleBatteryState battery_;
@@ -351,7 +355,8 @@ class YaleXSBLE : public Component,
   uint32_t last_lock_operation_complete_ms_{0};
   uint32_t last_operation_complete_ms_{0};
   uint32_t next_battery_attempt_ms_{0};
-  uint32_t last_notify_ms_{0};
+  uint32_t last_secure_notify_ms_{0};
+  uint32_t last_normal_notify_ms_{0};
   uint32_t last_unknown_state_update_request_ms_{0};
 };
 

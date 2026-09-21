@@ -1,11 +1,13 @@
 // Host platform substitutes for test_retry_recovery.py.
 #include <cassert>
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 template<typename... Args> void log(const char *, Args...) {}
 #define ESP_LOGW(...) log(__VA_ARGS__)
@@ -15,15 +17,21 @@ static const char *TAG = "test";
 static uint32_t now;
 uint32_t millis() { return now; }
 namespace espbt {
-enum class ClientState { IDLE, CONNECTING, DISCONNECTING };
+enum class ClientState { IDLE, CONNECTING, DISCONNECTING, ESTABLISHED };
 enum class ConnectionType { V3_WITH_CACHE, V3_WITHOUT_CACHE };
 }
 struct Client {
   espbt::ClientState state_{espbt::ClientState::IDLE};
+  espbt::ConnectionType connection_type_{espbt::ConnectionType::V3_WITHOUT_CACHE};
+  espbt::ConnectionType connection_type_at_connect_{espbt::ConnectionType::V3_WITHOUT_CACHE};
   unsigned connects{0}, disconnects{0};
   auto state() const { return state_; }
-  void set_connection_type(espbt::ConnectionType) {}
-  void connect() { connects++; state_ = espbt::ClientState::CONNECTING; }
+  void set_connection_type(espbt::ConnectionType type) { connection_type_ = type; }
+  void connect() {
+    connects++;
+    connection_type_at_connect_ = connection_type_;
+    state_ = espbt::ClientState::CONNECTING;
+  }
   void disconnect() {
     disconnects++;
     // ESPHome cannot actively disconnect until CONNECT_EVT supplies a conn_id.
@@ -42,13 +50,28 @@ class YaleXSBLE {
   void *lock_entity_{nullptr};
   unsigned failures{0};
   bool loop_enabled{true};
+  bool session_authenticated_{false};
+  uint32_t last_secure_notify_ms_{0};
+  uint32_t last_normal_notify_ms_{0};
+  unsigned run_next_calls{0};
+  unsigned writes{0};
+  bool cached_handles{false};
+  static constexpr uint32_t REQUEST_COOLDOWN_MS = 250;
   Client *parent() { return &client; }
   void enable_loop() { loop_enabled = true; }
   void disable_loop() { loop_enabled = false; }
   void status_set_warning(const char *) { failures++; }
   void publish_lock_state_() {}
-  bool cached_gatt_handles_valid_() { return false; }
+  const char *operation_to_string_(OperationType) { return "operation"; }
+  bool operation_queued_(OperationType operation) const {
+    return std::find(operation_queue_.begin(), operation_queue_.end(), operation) != operation_queue_.end();
+  }
+  void run_next_step_() { run_next_calls++; }
+  void write_command_now_(ResponseChannel, uint16_t, std::vector<uint8_t>, StepType, const char *) { writes++; }
+  bool cached_gatt_handles_valid_() { return cached_handles; }
   void reset_session_state_() {
+    session_authenticated_ = false;
+    session_shutting_down_ = false;
     active_step_ = StepType::NONE;
     pending_response_channel_ = ResponseChannel::NONE;
   }
@@ -89,6 +112,67 @@ int main(int argc, char **argv) {
   const std::string test = argv[1];
   YaleXSBLE yale;
   now = test == "wrap" ? UINT32_MAX - 50 : 1000;
+  if (test == "priority") {
+    yale.current_operation_ = YaleXSBLE::OperationType::UPDATE;
+    yale.session_authenticated_ = true;
+    yale.client.state_ = espbt::ClientState::ESTABLISHED;
+    yale.operation_queue_.push_back(YaleXSBLE::OperationType::REFRESH_DOOR);
+    yale.operation_queue_.push_back(YaleXSBLE::OperationType::UPDATE);
+    yale.set_timeout("cooldown", 100, []() {});
+    yale.queue_operation_(YaleXSBLE::OperationType::UNLOCK);
+    assert(yale.operation_queue_.size() == 2);
+    assert(yale.operation_queue_[0] == YaleXSBLE::OperationType::UNLOCK);
+    assert(yale.operation_queue_[1] == YaleXSBLE::OperationType::REFRESH_DOOR);
+    assert(yale.preempt_current_poll_);
+    assert(yale.run_next_calls == 0);
+    assert(yale.timers.count("cooldown") == 1);
+    return 0;
+  }
+  if (test == "reuse") {
+    yale.session_authenticated_ = true;
+    yale.client.state_ = espbt::ClientState::ESTABLISHED;
+    yale.operation_queue_.push_back(YaleXSBLE::OperationType::LOCK);
+    yale.tick();
+    assert(yale.current_operation_ == YaleXSBLE::OperationType::LOCK);
+    assert(yale.current_attempt_ == 1);
+    assert(yale.client.connects == 0);
+    assert(yale.run_next_calls == 1);
+    return 0;
+  }
+  if (test == "cooldown") {
+    const std::vector<uint8_t> command(18, 0);
+    yale.last_secure_notify_ms_ = now;
+    yale.write_command_(YaleXSBLE::ResponseChannel::SECURE_NOTIFY, 1, command,
+                        YaleXSBLE::StepType::SECURE_AUTH_2, "auth");
+    assert(yale.writes == 1);
+    assert(yale.timers.count("cooldown") == 0);
+
+    yale.session_authenticated_ = true;
+    yale.last_normal_notify_ms_ = 0;
+    yale.write_command_(YaleXSBLE::ResponseChannel::NORMAL_NOTIFY, 2, command,
+                        YaleXSBLE::StepType::FORCE_UNLOCK, "unlock");
+    assert(yale.writes == 2);
+
+    yale.last_normal_notify_ms_ = now - 100;
+    yale.write_command_(YaleXSBLE::ResponseChannel::NORMAL_NOTIFY, 2, command,
+                        YaleXSBLE::StepType::LOCK_STATUS, "status");
+    assert(yale.writes == 2);
+    assert(yale.timers.at("cooldown").due == now + 150);
+    yale.advance(149);
+    assert(yale.writes == 2);
+    yale.advance(1);
+    assert(yale.writes == 3);
+    return 0;
+  }
+  if (test == "aggressive") {
+    yale.cached_handles = true;
+    yale.operation_queue_.push_back(YaleXSBLE::OperationType::UPDATE);
+    yale.tick();
+    assert(yale.client.connects == 1);
+    assert(yale.client.connection_type_at_connect_ == espbt::ConnectionType::V3_WITHOUT_CACHE);
+    assert(yale.client.connection_type_ == espbt::ConnectionType::V3_WITH_CACHE);
+    return 0;
+  }
   yale.begin();
   if (test == "zero") yale.operation_retries_ = 0;
   yale.advance(101);

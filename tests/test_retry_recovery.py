@@ -12,9 +12,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 METHODS = (
-    "loop", "maybe_start_next_operation_", "start_current_attempt_",
+    "loop", "queue_operation_", "maybe_start_next_operation_", "start_current_attempt_",
     "connect_current_attempt_", "retry_current_operation_",
-    "fail_current_operation_", "force_disconnect_",
+    "fail_current_operation_", "force_disconnect_", "write_command_",
 )
 
 
@@ -78,3 +78,15 @@ class RetryRecoveryTest(unittest.TestCase):
 
     def test_timeout_across_millis_wraparound(self):
         self.run_case("wrap")
+
+    def test_lock_command_preempts_queued_background_work(self):
+        self.run_case("priority")
+
+    def test_authenticated_connection_is_reused(self):
+        self.run_case("reuse")
+
+    def test_cooldown_is_per_channel_and_post_auth_only(self):
+        self.run_case("cooldown")
+
+    def test_cached_connection_uses_fast_setup_parameters(self):
+        self.run_case("aggressive")

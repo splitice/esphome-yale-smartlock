@@ -354,7 +354,33 @@ void YaleXSBLE::queue_operation_(OperationType operation) {
       (this->current_operation_ == operation || this->operation_queued_(operation))) {
     return;
   }
-  this->operation_queue_.push_back(operation);
+
+  const bool priority_operation = operation == OperationType::LOCK || operation == OperationType::UNLOCK;
+  if (!priority_operation) {
+    this->operation_queue_.push_back(operation);
+    this->enable_loop();
+    return;
+  }
+  if (this->current_operation_ == operation)
+    return;
+
+  // The most recent physical command wins. A queued automatic update is stale
+  // once a lock command has been requested, while a manual door refresh can
+  // safely remain behind the command.
+  this->operation_queue_.erase(
+      std::remove_if(this->operation_queue_.begin(), this->operation_queue_.end(), [](OperationType queued) {
+        return queued == OperationType::LOCK || queued == OperationType::UNLOCK || queued == OperationType::UPDATE;
+      }),
+      this->operation_queue_.end());
+  this->operation_queue_.push_front(operation);
+
+  if (this->current_operation_ == OperationType::UPDATE || this->current_operation_ == OperationType::REFRESH_DOOR) {
+    this->preempt_current_poll_ = true;
+    this->steps_.clear();
+    // Let an in-flight request, including one whose encrypted bytes are waiting
+    // for the cooldown timer, finish first. Dropping an already-encrypted CBC
+    // command would desynchronize the lock's IV from ours.
+  }
   this->enable_loop();
 }
 
@@ -364,12 +390,44 @@ void YaleXSBLE::maybe_start_next_operation_() {
   this->current_operation_ = this->operation_queue_.front();
   this->operation_queue_.pop_front();
   this->current_attempt_ = 0;
+
+  if (this->session_authenticated_ && !this->session_shutting_down_ && this->parent() != nullptr &&
+      this->parent()->state() == espbt::ClientState::ESTABLISHED) {
+    ESP_LOGD(TAG, "Reusing authenticated BLE session for %s", this->operation_to_string_(this->current_operation_));
+    this->cancel_timeout("idle_disconnect");
+    this->current_attempt_ = 1;
+    this->operation_started_ms_ = millis();
+    this->operation_steps_built_ = false;
+    this->steps_.clear();
+    this->active_step_ = StepType::NONE;
+    this->pending_response_channel_ = ResponseChannel::NONE;
+    this->preempt_current_poll_ = false;
+    this->run_next_step_();
+    return;
+  }
+
   this->start_current_attempt_();
 }
 
 void YaleXSBLE::start_current_attempt_() {
   if (this->current_operation_ == OperationType::NONE)
     return;
+
+  // If a foreground lock command arrived while a background poll was being
+  // retried, abandon the poll before opening another connection for it.
+  if (this->preempt_current_poll_ && !this->session_authenticated_ &&
+      (this->current_operation_ == OperationType::UPDATE || this->current_operation_ == OperationType::REFRESH_DOOR) &&
+      !this->operation_queue_.empty() &&
+      (this->operation_queue_.front() == OperationType::LOCK ||
+       this->operation_queue_.front() == OperationType::UNLOCK)) {
+    this->current_operation_ = this->operation_queue_.front();
+    this->operation_queue_.pop_front();
+    this->current_attempt_ = 0;
+    this->preempt_current_poll_ = false;
+    ESP_LOGD(TAG, "Abandoned background poll for priority %s",
+             this->operation_to_string_(this->current_operation_));
+  }
+
   if (this->current_attempt_ > this->operation_retries_) {
     this->fail_current_operation_("retries exhausted");
     return;
@@ -404,6 +462,7 @@ void YaleXSBLE::start_current_attempt_() {
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
   this->pending_response_channel_ = ResponseChannel::NONE;
+  this->preempt_current_poll_ = false;
   this->reset_session_state_();
 
   this->connect_current_attempt_();
@@ -422,13 +481,22 @@ void YaleXSBLE::connect_current_attempt_() {
   }
 
   this->current_connection_uses_gatt_cache_ = this->cached_gatt_handles_valid_();
-  this->parent()->set_connection_type(this->current_connection_uses_gatt_cache_ ? espbt::ConnectionType::V3_WITH_CACHE
-                                                                                : espbt::ConnectionType::V3_WITHOUT_CACHE);
 
   ESP_LOGD(TAG, "Connecting to lock for attempt %u/%u using %s GATT handles", this->current_attempt_,
            this->operation_retries_ + 1, this->current_connection_uses_gatt_cache_ ? "cached" : "discovered");
   this->ignore_next_disconnect_ = false;
-  this->parent()->connect();
+  if (this->current_connection_uses_gatt_cache_) {
+    // ESPHome normally selects its medium (8.75-11.25 ms) parameters for a
+    // cached connection. Select its fast 7.5 ms setup parameters for the open
+    // call, then restore the cached type before the asynchronous OPEN event so
+    // service discovery is still skipped.
+    this->parent()->set_connection_type(espbt::ConnectionType::V3_WITHOUT_CACHE);
+    this->parent()->connect();
+    this->parent()->set_connection_type(espbt::ConnectionType::V3_WITH_CACHE);
+  } else {
+    this->parent()->set_connection_type(espbt::ConnectionType::V3_WITHOUT_CACHE);
+    this->parent()->connect();
+  }
   this->set_timeout("connect_timeout", this->connect_timeout_ms_, [this]() {
     this->retry_current_operation_("connect timeout");
   });
@@ -480,6 +548,7 @@ void YaleXSBLE::fail_current_operation_(const char *reason) {
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
+  this->preempt_current_poll_ = false;
   this->enable_loop();
 }
 
@@ -489,6 +558,13 @@ void YaleXSBLE::complete_current_operation_() {
     return;
   }
   this->status_clear_warning();
+  if (!this->operation_queue_.empty() && this->session_authenticated_ && !this->session_shutting_down_ &&
+      this->parent() != nullptr && this->parent()->state() == espbt::ClientState::ESTABLISHED) {
+    ESP_LOGD(TAG, "Keeping authenticated BLE session for queued %s",
+             this->operation_to_string_(this->operation_queue_.front()));
+    this->finish_operation_and_disconnect_();
+    return;
+  }
   if (this->session_authenticated_ && this->secure_write_handle_ != 0) {
     this->execute_shutdown_();
     return;
@@ -508,6 +584,7 @@ void YaleXSBLE::finish_operation_and_disconnect_() {
   this->operation_steps_built_ = false;
   this->steps_.clear();
   this->active_step_ = StepType::NONE;
+  this->preempt_current_poll_ = false;
   const uint32_t idle_delay = this->operation_queue_.empty() ? 100 : IDLE_DISCONNECT_MS;
   this->set_timeout("idle_disconnect", idle_delay, [this]() {
     if (this->current_operation_ == OperationType::NONE)
@@ -528,6 +605,8 @@ void YaleXSBLE::force_disconnect_(const char *reason) {
 
 void YaleXSBLE::reset_session_state_() {
   this->session_authenticated_ = false;
+  this->session_shutting_down_ = false;
+  this->aggressive_conn_params_requested_ = false;
   this->pending_cccd_handle_ = 0;
   this->pending_notify_handle_ = 0;
   this->pending_read_handle_ = 0;
@@ -537,6 +616,8 @@ void YaleXSBLE::reset_session_state_() {
   this->lock_seen_this_session_ = false;
   this->door_seen_this_session_ = false;
   this->battery_seen_this_session_ = false;
+  this->last_secure_notify_ms_ = 0;
+  this->last_normal_notify_ms_ = 0;
   this->normal_encrypt_iv_.fill(0);
   this->normal_decrypt_iv_.fill(0);
 }
@@ -544,6 +625,12 @@ void YaleXSBLE::reset_session_state_() {
 void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                     esp_ble_gattc_cb_param_t *param) {
   switch (event) {
+    case ESP_GATTC_CONNECT_EVT:
+      if (!this->parent()->check_addr(param->connect.remote_bda))
+        return;
+      this->request_aggressive_connection_params_();
+      break;
+
     case ESP_GATTC_OPEN_EVT:
       if (!this->parent()->check_addr(param->open.remote_bda))
         return;
@@ -616,8 +703,8 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
       if (this->parent()->get_conn_id() != param->notify.conn_id)
         return;
       std::vector<uint8_t> data(param->notify.value, param->notify.value + param->notify.value_len);
-      this->last_notify_ms_ = millis();
       if (param->notify.handle == this->secure_read_handle_) {
+        this->last_secure_notify_ms_ = millis();
         auto decrypted = data;
         if (!this->decrypt_secure_(decrypted)) {
           this->retry_current_operation_("secure decrypt failed");
@@ -626,6 +713,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
         if (this->pending_response_channel_ == ResponseChannel::SECURE_NOTIFY)
           this->handle_secure_response_(data, decrypted);
       } else if (param->notify.handle == this->normal_read_handle_) {
+        this->last_normal_notify_ms_ = millis();
         auto decrypted = data;
         if (!this->decrypt_normal_(decrypted)) {
           this->retry_current_operation_("normal decrypt failed");
@@ -690,20 +778,33 @@ void YaleXSBLE::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
   }
 }
 
-void YaleXSBLE::on_connected_(bool services_discovered) {
-  if (this->current_operation_ == OperationType::NONE || this->retry_pending_ || this->ignore_next_disconnect_)
+void YaleXSBLE::request_aggressive_connection_params_() {
+  if (this->aggressive_conn_params_requested_ || this->parent() == nullptr)
     return;
-  ESP_LOGD(TAG, "Connected; %s Yale GATT handles", services_discovered ? "resolving" : "using cached");
-  this->ignore_next_disconnect_ = false;
-  this->node_state = espbt::ClientState::ESTABLISHED;
 
+  // 0x06 is the BLE minimum connection interval: 6 * 1.25 ms = 7.5 ms.
   esp_ble_conn_update_params_t conn_params = {};
   memcpy(conn_params.bda, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t));
   conn_params.min_int = 0x06;
   conn_params.max_int = 0x06;
   conn_params.latency = 0;
   conn_params.timeout = 400;
-  esp_ble_gap_update_conn_params(&conn_params);
+  const esp_err_t err = esp_ble_gap_update_conn_params(&conn_params);
+  if (err == ESP_OK) {
+    this->aggressive_conn_params_requested_ = true;
+    ESP_LOGD(TAG, "Requested aggressive BLE connection params: interval=7.5ms latency=0 timeout=4000ms");
+  } else {
+    ESP_LOGW(TAG, "Failed to request aggressive BLE connection params: err=%d", err);
+  }
+}
+
+void YaleXSBLE::on_connected_(bool services_discovered) {
+  if (this->current_operation_ == OperationType::NONE || this->retry_pending_ || this->ignore_next_disconnect_)
+    return;
+  ESP_LOGD(TAG, "Connected; %s Yale GATT handles", services_discovered ? "resolving" : "using cached");
+  this->ignore_next_disconnect_ = false;
+  this->node_state = espbt::ClientState::ESTABLISHED;
+  this->request_aggressive_connection_params_();
 
   if (services_discovered && !this->resolve_handles_()) {
     this->retry_current_operation_("missing Yale characteristics");
@@ -982,6 +1083,17 @@ void YaleXSBLE::run_next_step_() {
   if (!this->session_authenticated_) {
     return;
   }
+
+  if (this->preempt_current_poll_ &&
+      (this->current_operation_ == OperationType::UPDATE || this->current_operation_ == OperationType::REFRESH_DOOR)) {
+    ESP_LOGD(TAG, "Preempting background %s for queued lock command",
+             this->operation_to_string_(this->current_operation_));
+    this->steps_.clear();
+    this->operation_steps_built_ = true;
+    this->preempt_current_poll_ = false;
+    this->complete_current_operation_();
+    return;
+  }
   if (millis() - this->operation_started_ms_ > this->operation_timeout_ms_) {
     this->retry_current_operation_("operation timeout");
     return;
@@ -1155,6 +1267,7 @@ void YaleXSBLE::execute_shutdown_() {
     this->finish_operation_and_disconnect_();
     return;
   }
+  this->session_shutting_down_ = true;
   this->write_command_(ResponseChannel::SECURE_NOTIFY, this->secure_write_handle_, std::move(command), StepType::SHUTDOWN,
                        "shutdown");
 }
@@ -1162,8 +1275,15 @@ void YaleXSBLE::execute_shutdown_() {
 void YaleXSBLE::write_command_(ResponseChannel channel, uint16_t handle, std::vector<uint8_t> command, StepType step,
                                const char *name) {
   const uint32_t now = millis();
-  if (this->last_notify_ms_ != 0 && now - this->last_notify_ms_ < REQUEST_COOLDOWN_MS) {
-    const uint32_t wait = REQUEST_COOLDOWN_MS - (now - this->last_notify_ms_);
+  uint32_t last_notify_ms = 0;
+  if (this->session_authenticated_) {
+    if (channel == ResponseChannel::SECURE_NOTIFY)
+      last_notify_ms = this->last_secure_notify_ms_;
+    else if (channel == ResponseChannel::NORMAL_NOTIFY)
+      last_notify_ms = this->last_normal_notify_ms_;
+  }
+  if (last_notify_ms != 0 && now - last_notify_ms < REQUEST_COOLDOWN_MS) {
+    const uint32_t wait = REQUEST_COOLDOWN_MS - (now - last_notify_ms);
     this->set_timeout("cooldown", wait, [this, channel, handle, command = std::move(command), step, name]() mutable {
       this->write_command_now_(channel, handle, std::move(command), step, name);
     });
@@ -1247,21 +1367,28 @@ void YaleXSBLE::handle_normal_response_(std::vector<uint8_t> decrypted) {
     return;
   }
 
-  this->parse_state_response_(decrypted);
-  if (this->active_step_ == StepType::BATTERY_STATUS) {
-    const auto battery = this->parse_battery_state_(decrypted);
-    if (battery.valid && battery.voltage <= 3.0f) {
+  const bool discard_preempted_poll = this->preempt_current_poll_ &&
+                                      (this->current_operation_ == OperationType::UPDATE ||
+                                       this->current_operation_ == OperationType::REFRESH_DOOR);
+  if (!discard_preempted_poll) {
+    this->parse_state_response_(decrypted);
+    if (this->active_step_ == StepType::BATTERY_STATUS) {
+      const auto battery = this->parse_battery_state_(decrypted);
+      if (battery.valid && battery.voltage <= 3.0f) {
+        this->update_battery_(battery);
+        this->retry_current_operation_("impossible battery voltage");
+        return;
+      }
       this->update_battery_(battery);
-      this->retry_current_operation_("impossible battery voltage");
+      this->next_battery_attempt_ms_ = 0;
+    }
+
+    if (this->active_step_ == StepType::LOCK_STATUS && this->is_bad_lock_state_(this->lock_status_)) {
+      this->retry_current_operation_("bad lock state");
       return;
     }
-    this->update_battery_(battery);
-    this->next_battery_attempt_ms_ = 0;
-  }
-
-  if (this->active_step_ == StepType::LOCK_STATUS && this->is_bad_lock_state_(this->lock_status_)) {
-    this->retry_current_operation_("bad lock state");
-    return;
+  } else {
+    ESP_LOGD(TAG, "Discarding response from preempted background poll");
   }
 
   this->active_step_ = StepType::NONE;
