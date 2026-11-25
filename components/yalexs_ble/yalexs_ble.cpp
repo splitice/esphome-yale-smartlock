@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 
 namespace esphome::yalexs_ble {
@@ -184,14 +185,17 @@ void YaleXSBLE::publish_last_seen_(const espbt::ESPBTDevice &device) {
   if (this->last_seen_broadcast_sensor_ == nullptr)
     return;
 
-  std::string message = "address=" + device.address_str();
+  char address[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+  std::string message = "address=";
+  message += device.address_str_to(address);
   message += ", name=";
   const auto &name = device.get_name();
   if (name.empty())
     message += "(none)";
   else
     message.append(name.begin(), name.end());
-  message += ", rssi=" + str_sprintf("%d", device.get_rssi());
+  message += ", rssi=";
+  message += std::to_string(device.get_rssi());
   message += ", mfr=";
 
   bool first = true;
@@ -206,7 +210,15 @@ void YaleXSBLE::publish_last_seen_(const espbt::ESPBTDevice &device) {
     if (!first)
       message += ";";
     first = false;
-    message += str_sprintf("%04" PRIX32 ":%s", id, format_hex(mfr.data).c_str());
+    char id_buf[sizeof("FFFFFFFF:")];
+    std::snprintf(id_buf, sizeof(id_buf), "%04" PRIX32 ":", id);
+    message += id_buf;
+
+    const size_t payload_offset = message.size();
+    const size_t hex_size = format_hex_size(mfr.data.size());
+    // The formatter uses the string's trailing null terminator.
+    message.resize(payload_offset + hex_size - 1);
+    format_hex_to(message.data() + payload_offset, hex_size, mfr.data.data(), mfr.data.size());
   }
   if (first)
     message += "(none)";
