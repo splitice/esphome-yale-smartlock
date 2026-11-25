@@ -41,7 +41,6 @@ enum YaleCommand : uint8_t {
   COMMAND_GETSTATUS = 0x02,
   COMMAND_UNLOCK = 0x0A,
   COMMAND_LOCK = 0x0B,
-  COMMAND_LOCK_ACTIVITY = 0x2D,
 };
 
 enum YaleStatusType : uint8_t {
@@ -50,6 +49,12 @@ enum YaleStatusType : uint8_t {
   STATUS_DOOR_ONLY = 0x2E,
   STATUS_DOOR_AND_LOCK = 0x2F,
 };
+
+// Yale reports motor failures in the operation result, separately from lock status.
+static constexpr size_t MOTOR_RESULT_OFFSET = 15;
+static constexpr uint8_t MOTOR_SUCCESS = 0x00;
+static constexpr uint8_t MOTOR_FIRST_MECHANICAL_ERROR = 0x1E;
+static constexpr uint8_t MOTOR_LAST_MECHANICAL_ERROR = 0x23;
 
 bool YaleLockInfo::door_sense() const {
   if (!this->valid || this->model.empty())
@@ -120,6 +125,7 @@ void YaleXSBLE::dump_config() {
   LOG_LOCK("  ", "Lock", this->lock_entity_);
   LOG_BUTTON("  ", "Refresh Door Status", this->refresh_button_);
   LOG_BINARY_SENSOR("  ", "Door", this->door_binary_sensor_);
+  LOG_TEXT_SENSOR("  ", "Lock Status", this->lock_status_sensor_);
   LOG_TEXT_SENSOR("  ", "Door Status", this->door_status_sensor_);
   LOG_TEXT_SENSOR("  ", "Last Seen Broadcast", this->last_seen_broadcast_sensor_);
   LOG_SENSOR("  ", "Battery Level", this->battery_level_sensor_);
@@ -389,6 +395,8 @@ void YaleXSBLE::maybe_start_next_operation_() {
     return;
   this->current_operation_ = this->operation_queue_.front();
   this->operation_queue_.pop_front();
+  this->motor_progress_ = MotorProgress::NONE;
+  this->lock_status_confirmed_ = false;
   this->current_attempt_ = 0;
 
   if (this->session_authenticated_ && !this->session_shutting_down_ && this->parent() != nullptr &&
@@ -505,6 +513,19 @@ void YaleXSBLE::connect_current_attempt_() {
 void YaleXSBLE::retry_current_operation_(const char *reason) {
   if (this->current_operation_ == OperationType::NONE || this->retry_pending_)
     return;
+  // A lost result after acknowledgement leaves the outcome unknown. Do not
+  // drive the motor a second time on an automatic retry.
+  if (this->motor_progress_ == MotorProgress::ACKNOWLEDGED) {
+    ESP_LOGW(TAG, "Motor result unavailable after acknowledgement: %s", reason);
+    this->update_lock_status_(YaleLockStatus::UNKNOWN);
+    this->fail_current_operation_("motor result unavailable after acknowledgement");
+    this->queue_status_update();
+    return;
+  }
+  if (this->current_attempt_ > this->operation_retries_) {
+    this->fail_current_operation_(reason);
+    return;
+  }
   // Disarm the expired attempt before disconnecting. Otherwise loop() keeps
   // replacing the retry timer, so its callback never gets a chance to run.
   this->retry_pending_ = true;
@@ -520,11 +541,6 @@ void YaleXSBLE::retry_current_operation_(const char *reason) {
   this->ble_idle_wait_started_ms_ = millis();
   this->force_disconnect_(reason);
 
-  if (this->current_attempt_ > this->operation_retries_) {
-    this->fail_current_operation_(reason);
-    return;
-  }
-
   this->set_timeout("retry", 250, [this]() { this->start_current_attempt_(); });
 }
 
@@ -537,11 +553,12 @@ void YaleXSBLE::fail_current_operation_(const char *reason) {
   this->cancel_timeout("notify_register_fallback");
   this->cancel_timeout("retry");
   this->cancel_timeout("retry_after_disconnect");
+  const bool status_unconfirmed = this->motor_progress_ == MotorProgress::SUCCEEDED && !this->lock_status_confirmed_;
   this->force_disconnect_(reason);
-  if (this->lock_entity_ != nullptr &&
-      (this->current_operation_ == OperationType::LOCK || this->current_operation_ == OperationType::UNLOCK)) {
+  if (status_unconfirmed)
+    this->update_lock_status_(YaleLockStatus::UNKNOWN);
+  else if (this->is_lock_operation_())
     this->publish_lock_state_();
-  }
   this->current_operation_ = OperationType::NONE;
   this->retry_pending_ = false;
   this->waiting_for_ble_idle_ = false;
@@ -574,7 +591,7 @@ void YaleXSBLE::complete_current_operation_() {
 
 void YaleXSBLE::finish_operation_and_disconnect_() {
   const uint32_t now = millis();
-  if (this->current_operation_ == OperationType::LOCK || this->current_operation_ == OperationType::UNLOCK)
+  if (this->is_lock_operation_())
     this->last_lock_operation_complete_ms_ = now;
   this->last_operation_complete_ms_ = now;
 
@@ -613,7 +630,7 @@ void YaleXSBLE::reset_session_state_() {
   this->pending_notify_setup_ = NotifySetup::NONE;
   this->pending_response_channel_ = ResponseChannel::NONE;
   this->active_step_ = StepType::NONE;
-  this->lock_seen_this_session_ = false;
+  this->lock_status_confirmed_ = false;
   this->door_seen_this_session_ = false;
   this->battery_seen_this_session_ = false;
   this->last_secure_notify_ms_ = 0;
@@ -719,10 +736,7 @@ void YaleXSBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t ga
           this->retry_current_operation_("normal decrypt failed");
           return;
         }
-        if (this->pending_response_channel_ == ResponseChannel::NORMAL_NOTIFY)
-          this->handle_normal_response_(decrypted);
-        else
-          this->handle_unsolicited_normal_(decrypted);
+        this->handle_normal_response_(decrypted);
       }
       break;
     }
@@ -1150,13 +1164,12 @@ void YaleXSBLE::build_operation_steps_() {
       this->steps_.push_back(StepType::DOOR_STATUS);
       break;
     case OperationType::LOCK:
-      this->steps_.push_back(StepType::FORCE_LOCK);
-      this->steps_.push_back(StepType::LOCK_STATUS);
-      if (this->lock_info_.door_sense())
-        this->steps_.push_back(StepType::DOOR_STATUS);
-      break;
     case OperationType::UNLOCK:
-      this->steps_.push_back(StepType::FORCE_UNLOCK);
+      // If verification has to reconnect, the motor has already moved.
+      if (this->motor_progress_ != MotorProgress::SUCCEEDED) {
+        this->steps_.push_back(this->current_operation_ == OperationType::LOCK ? StepType::FORCE_LOCK
+                                                                             : StepType::FORCE_UNLOCK);
+      }
       this->steps_.push_back(StepType::LOCK_STATUS);
       if (this->lock_info_.door_sense())
         this->steps_.push_back(StepType::DOOR_STATUS);
@@ -1359,43 +1372,90 @@ void YaleXSBLE::handle_secure_response_(std::vector<uint8_t> encrypted, std::vec
   }
 }
 
-void YaleXSBLE::handle_normal_response_(std::vector<uint8_t> decrypted) {
-  this->cancel_timeout("command_timeout");
-  this->pending_response_channel_ = ResponseChannel::NONE;
-  if (!validate_simple_response_(decrypted)) {
-    this->retry_current_operation_("normal response checksum failed");
+bool YaleXSBLE::matches_normal_response_(const std::vector<uint8_t> &response) const {
+  if (response[0] != 0xBB)
+    return false;
+  switch (this->active_step_) {
+    case StepType::FORCE_LOCK:
+      return response[1] == COMMAND_LOCK;
+    case StepType::FORCE_UNLOCK:
+      return response[1] == COMMAND_UNLOCK;
+    case StepType::BATTERY_STATUS:
+      return response[1] == COMMAND_GETSTATUS && response[4] == STATUS_BATTERY;
+    case StepType::DOOR_STATUS:
+      return response[1] == COMMAND_GETSTATUS && response[4] == STATUS_DOOR_ONLY;
+    case StepType::LOCK_STATUS:
+      return response[1] == COMMAND_GETSTATUS && response[4] == STATUS_LOCK_ONLY;
+    default:
+      return false;
+  }
+}
+
+void YaleXSBLE::handle_normal_response_(const std::vector<uint8_t> &response) {
+  const bool waiting = this->pending_response_channel_ == ResponseChannel::NORMAL_NOTIFY;
+  if (!validate_simple_response_(response)) {
+    if (waiting)
+      ESP_LOGD(TAG, "Ignoring invalid normal notification while waiting for %s",
+               this->step_to_string_(this->active_step_));
     return;
   }
 
-  const bool discard_preempted_poll = this->preempt_current_poll_ &&
-                                      (this->current_operation_ == OperationType::UPDATE ||
-                                       this->current_operation_ == OperationType::REFRESH_DOOR);
-  if (!discard_preempted_poll) {
-    this->parse_state_response_(decrypted);
-    if (this->active_step_ == StepType::BATTERY_STATUS) {
-      const auto battery = this->parse_battery_state_(decrypted);
+  const auto step = this->active_step_;
+  const bool motor_step = step == StepType::FORCE_LOCK || step == StepType::FORCE_UNLOCK;
+  if (waiting && motor_step && response[0] == 0xAA && response[4] == 0 &&
+      response[1] == (step == StepType::FORCE_LOCK ? COMMAND_LOCK : COMMAND_UNLOCK)) {
+    this->motor_progress_ = MotorProgress::ACKNOWLEDGED;
+    return;
+  }
+
+  if (!waiting || !this->matches_normal_response_(response)) {
+    // DoorSense can update independently. Lock state must wait for the motor
+    // result and the lock-only status read that follows it.
+    if (!this->preempt_current_poll_)
+      this->parse_state_response_(response, !this->is_lock_operation_());
+    return;
+  }
+
+  this->cancel_timeout("command_timeout");
+  this->pending_response_channel_ = ResponseChannel::NONE;
+  if (motor_step) {
+    const uint8_t result = response[MOTOR_RESULT_OFFSET];
+    if (result != MOTOR_SUCCESS) {
+      ESP_LOGW(TAG, "%s returned motor result 0x%02x", this->operation_to_string_(this->current_operation_), result);
+      if (result >= MOTOR_FIRST_MECHANICAL_ERROR && result <= MOTOR_LAST_MECHANICAL_ERROR)
+        this->update_lock_status_(YaleLockStatus::JAMMED);
+      this->fail_current_operation_("lock reported operation failure");
+      return;
+    }
+    this->motor_progress_ = MotorProgress::SUCCEEDED;
+  } else if (!this->preempt_current_poll_) {
+    this->parse_state_response_(response, step == StepType::LOCK_STATUS || !this->is_lock_operation_());
+    if (step == StepType::BATTERY_STATUS) {
+      const auto battery = this->parse_battery_state_(response);
+      this->update_battery_(battery);
       if (battery.valid && battery.voltage <= 3.0f) {
-        this->update_battery_(battery);
         this->retry_current_operation_("impossible battery voltage");
         return;
       }
-      this->update_battery_(battery);
       this->next_battery_attempt_ms_ = 0;
     }
 
-    if (this->active_step_ == StepType::LOCK_STATUS && this->is_bad_lock_state_(this->lock_status_)) {
-      this->retry_current_operation_("bad lock state");
-      return;
+    if (step == StepType::LOCK_STATUS) {
+      if (this->is_bad_lock_state_(this->lock_status_)) {
+        this->retry_current_operation_("bad lock state");
+        return;
+      }
+      this->lock_status_confirmed_ = true;
+      if (this->is_lock_operation_() && this->lock_status_ == YaleLockStatus::JAMMED) {
+        this->fail_current_operation_("lock reported a jam");
+        return;
+      }
     }
-  } else {
-    ESP_LOGD(TAG, "Discarding response from preempted background poll");
   }
 
   this->active_step_ = StepType::NONE;
   this->run_next_step_();
 }
-
-void YaleXSBLE::handle_unsolicited_normal_(const std::vector<uint8_t> &decrypted) { this->parse_state_response_(decrypted); }
 
 void YaleXSBLE::handle_command_timeout_() {
   ESP_LOGW(TAG, "Command timeout: operation=%s attempt=%u/%u step=%s response=%s notify_setup=%s notify=0x%04x cccd=0x%04x",
@@ -1411,7 +1471,7 @@ void YaleXSBLE::handle_command_timeout_() {
   }
   if (this->active_step_ == StepType::BATTERY_STATUS)
     this->next_battery_attempt_ms_ = millis() + BATTERY_TIMEOUT_COOLDOWN_MS;
-  if (this->current_connection_uses_gatt_cache_)
+  if (this->current_connection_uses_gatt_cache_ && this->motor_progress_ != MotorProgress::ACKNOWLEDGED)
     this->invalidate_gatt_cache_("cached GATT command timeout");
   this->retry_current_operation_("command timeout");
 }
@@ -1540,38 +1600,22 @@ bool YaleXSBLE::validate_secure_response_(const std::vector<uint8_t> &response) 
   return response_checksum == security_checksum_(response);
 }
 
-void YaleXSBLE::parse_state_response_(const std::vector<uint8_t> &response) {
-  if (response.size() < 9)
+void YaleXSBLE::parse_state_response_(const std::vector<uint8_t> &response, bool publish_lock) {
+  if (response[0] != 0xBB)
     return;
-  if (response[0] == 0xBB) {
-    if ((response[1] == COMMAND_LOCK || response[1] == COMMAND_UNLOCK) && response.size() > 3) {
-      this->update_lock_status_(this->parse_lock_status_(response[3]));
-      return;
-    }
-    if (response[1] == COMMAND_LOCK_ACTIVITY)
-      return;
-    if (response[1] == COMMAND_GETSTATUS) {
-      if (response[4] == STATUS_LOCK_ONLY) {
-        this->update_lock_status_(this->parse_lock_status_(response[8]));
-      } else if (response[4] == STATUS_DOOR_ONLY) {
-        this->update_door_status_(this->parse_door_status_(response[8]));
-      } else if (response[4] == STATUS_DOOR_AND_LOCK) {
-        this->parse_lock_and_door_state_(response);
-      }
-    }
-  } else if (response[0] == 0xAA) {
-    if (response[1] == COMMAND_UNLOCK)
-      this->update_lock_status_(YaleLockStatus::UNLOCKED);
-    else if (response[1] == COMMAND_LOCK)
-      this->update_lock_status_(YaleLockStatus::LOCKED);
+  if (response[1] == COMMAND_LOCK || response[1] == COMMAND_UNLOCK) {
+    const uint8_t result = response[MOTOR_RESULT_OFFSET];
+    if (publish_lock && result >= MOTOR_FIRST_MECHANICAL_ERROR && result <= MOTOR_LAST_MECHANICAL_ERROR)
+      this->update_lock_status_(YaleLockStatus::JAMMED);
+    return;
   }
-}
-
-void YaleXSBLE::parse_lock_and_door_state_(const std::vector<uint8_t> &response) {
-  if (response.size() < 10)
+  if (response[1] != COMMAND_GETSTATUS)
     return;
-  this->update_lock_status_(this->parse_lock_status_(response[8]));
-  this->update_door_status_(this->parse_door_status_(response[9]));
+  const uint8_t status = response[4];
+  if (publish_lock && (status == STATUS_LOCK_ONLY || status == STATUS_DOOR_AND_LOCK))
+    this->update_lock_status_(this->parse_lock_status_(response[8]));
+  if (status == STATUS_DOOR_ONLY || status == STATUS_DOOR_AND_LOCK)
+    this->update_door_status_(this->parse_door_status_(response[status == STATUS_DOOR_ONLY ? 8 : 9]));
 }
 
 YaleLockStatus YaleXSBLE::parse_lock_status_(uint8_t value) const {
@@ -1588,10 +1632,10 @@ YaleLockStatus YaleXSBLE::parse_lock_status_(uint8_t value) const {
       return YaleLockStatus::LOCKED;
     case 0x06:
       return YaleLockStatus::UNKNOWN_06;
+    case 0x07:
+      return YaleLockStatus::JAMMED;
     case 0x0C:
       return YaleLockStatus::SECUREMODE;
-    case 0x1B:
-      return YaleLockStatus::JAMMED;
     default:
       return YaleLockStatus::UNKNOWN;
   }
@@ -1643,11 +1687,11 @@ uint8_t YaleXSBLE::convert_voltage_to_percentage_(float single_cell_voltage) {
 }
 
 void YaleXSBLE::update_lock_status_(YaleLockStatus status) {
-  if (this->lock_status_ == status)
-    return;
-  this->lock_status_ = status;
-  this->lock_seen_this_session_ = true;
-  this->last_state_change_ms_ = millis();
+  if (this->lock_status_ != status) {
+    this->lock_status_ = status;
+    this->last_state_change_ms_ = millis();
+  }
+  // The entity may be showing a transition even when the cached value matches.
   this->publish_lock_state_();
 }
 
@@ -1669,6 +1713,11 @@ void YaleXSBLE::update_battery_(const YaleBatteryState &battery) {
 }
 
 void YaleXSBLE::publish_lock_state_() {
+  if (this->lock_status_sensor_ != nullptr) {
+    const char *status = this->lock_status_to_string_(this->lock_status_);
+    if (!this->lock_status_sensor_->has_state() || this->lock_status_sensor_->state != status)
+      this->lock_status_sensor_->publish_state(status);
+  }
   if (this->lock_entity_ == nullptr)
     return;
   if (this->is_jammed_state_(this->lock_status_)) {
@@ -1717,7 +1766,14 @@ void YaleXSBLE::publish_battery_state_() {
     this->battery_voltage_sensor_->publish_state(this->battery_.voltage);
 }
 
+bool YaleXSBLE::is_lock_operation_() const {
+  return this->current_operation_ == OperationType::LOCK || this->current_operation_ == OperationType::UNLOCK;
+}
+
 bool YaleXSBLE::is_expected_complete_() const {
+  if (this->is_lock_operation_() &&
+      (this->motor_progress_ != MotorProgress::SUCCEEDED || !this->lock_status_confirmed_))
+    return false;
   if (this->current_operation_ == OperationType::LOCK)
     return this->lock_status_ == YaleLockStatus::LOCKED || this->lock_status_ == YaleLockStatus::SECUREMODE;
   if (this->current_operation_ == OperationType::UNLOCK)

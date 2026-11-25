@@ -37,6 +37,7 @@ CONF_DOOR = "door"
 CONF_DOOR_STATUS = "door_status"
 CONF_LAST_SEEN_BROADCAST = "last_seen_broadcast"
 CONF_LOCK = "lock"
+CONF_LOCK_STATUS = "lock_status"
 CONF_LOCAL_NAME = "local_name"
 CONF_OPERATION_RETRIES = "operation_retries"
 CONF_CONNECT_TIMEOUT = "connect_timeout"
@@ -88,6 +89,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_COMMAND_TIMEOUT, default="10s"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_OPERATION_TIMEOUT, default="20s"): cv.positive_time_period_milliseconds,
             cv.Required(CONF_LOCK): lock.lock_schema(YaleXSBLELock),
+            cv.Optional(CONF_LOCK_STATUS): text_sensor.text_sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                icon="mdi:lock",
+            ),
             cv.Optional(CONF_REFRESH_DOOR_STATUS): button.button_schema(
                 YaleXSBLERefreshButton,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
@@ -175,6 +180,10 @@ async def to_code(config):
     lock_var = await lock.new_lock(config[CONF_LOCK])
     cg.add(lock_var.set_parent(var))
     cg.add(var.set_lock(lock_var))
+
+    if lock_status_config := config.get(CONF_LOCK_STATUS):
+        lock_status = await text_sensor.new_text_sensor(lock_status_config)
+        cg.add(var.set_lock_status_text_sensor(lock_status))
 
     if refresh_config := config.get(CONF_REFRESH_DOOR_STATUS):
         refresh = await button.new_button(refresh_config)

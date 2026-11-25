@@ -41,14 +41,31 @@ struct Client {
       state_ = espbt::ClientState::DISCONNECTING;
   }
 };
+// PRODUCTION_PROTOCOL
+
+struct YaleBatteryState {
+  bool valid{false};
+  float voltage{0};
+};
+
 class YaleXSBLE {
  public:
   // PRODUCTION_DECLARATIONS
   struct Timer { uint32_t due; std::function<void()> callback; };
   std::map<std::string, Timer> timers;
   Client client;
-  void *lock_entity_{nullptr};
+  struct {
+    std::string model{"YUR/SSDL/1/SIL"};
+    bool door_sense() const { return true; }
+  } lock_info_;
+  YaleLockStatus lock_status_{YaleLockStatus::LOCKED};
+  YaleDoorStatus door_status_{YaleDoorStatus::UNKNOWN};
+  uint32_t last_state_change_ms_{0};
+  uint32_t next_battery_attempt_ms_{0};
+  uint16_t pending_notify_handle_{0}, pending_cccd_handle_{0};
+  NotifySetup pending_notify_setup_{NotifySetup::NONE};
   unsigned failures{0};
+  unsigned lock_publications{0}, battery_updates{0};
   bool loop_enabled{true};
   bool session_authenticated_{false};
   uint32_t last_secure_notify_ms_{0};
@@ -57,23 +74,34 @@ class YaleXSBLE {
   unsigned writes{0};
   bool cached_handles{false};
   static constexpr uint32_t REQUEST_COOLDOWN_MS = 250;
+  static constexpr uint32_t BATTERY_TIMEOUT_COOLDOWN_MS = 300000;
   Client *parent() { return &client; }
   void enable_loop() { loop_enabled = true; }
   void disable_loop() { loop_enabled = false; }
   void status_set_warning(const char *) { failures++; }
-  void publish_lock_state_() {}
+  void publish_lock_state_() { lock_publications++; }
+  void update_door_status_(YaleDoorStatus status) { door_status_ = status; }
+  YaleBatteryState parse_battery_state_(const std::vector<uint8_t> &) const { return {true, 6.0}; }
+  void update_battery_(const YaleBatteryState &) { battery_updates++; }
   const char *operation_to_string_(OperationType) { return "operation"; }
+  const char *step_to_string_(StepType) { return "step"; }
+  const char *response_channel_to_string_(ResponseChannel) { return "channel"; }
+  const char *notify_setup_to_string_(NotifySetup) { return "notify"; }
   bool operation_queued_(OperationType operation) const {
     return std::find(operation_queue_.begin(), operation_queue_.end(), operation) != operation_queue_.end();
   }
   void run_next_step_() { run_next_calls++; }
   void write_command_now_(ResponseChannel, uint16_t, std::vector<uint8_t>, StepType, const char *) { writes++; }
   bool cached_gatt_handles_valid_() { return cached_handles; }
+  void invalidate_gatt_cache_(const char *) { cached_handles = false; }
+  void finish_operation_and_disconnect_() {}
+  void queue_status_update() { queue_operation_(OperationType::UPDATE); }
   void reset_session_state_() {
     session_authenticated_ = false;
     session_shutting_down_ = false;
     active_step_ = StepType::NONE;
     pending_response_channel_ = ResponseChannel::NONE;
+    lock_status_confirmed_ = false;
   }
   StepType active_step_{StepType::NONE};
   ResponseChannel pending_response_channel_{ResponseChannel::NONE};
@@ -105,13 +133,129 @@ class YaleXSBLE {
     tick();
     assert(client.connects == 1);
   }
+  void wait_for(StepType step) {
+    active_step_ = step;
+    pending_response_channel_ = ResponseChannel::NORMAL_NOTIFY;
+    set_timeout("command_timeout", 1000, [this]() { handle_command_timeout_(); });
+  }
 };
 // PRODUCTION_METHODS
+
+static std::vector<uint8_t> response(uint8_t header, uint8_t opcode, uint8_t subtype = 0,
+                                     uint8_t state = 0, uint8_t result = 0) {
+  std::vector<uint8_t> frame(18, 0);
+  frame[0] = header;
+  frame[1] = opcode;
+  frame[4] = subtype;
+  frame[8] = state;
+  frame[MOTOR_RESULT_OFFSET] = result;
+  frame[3] = static_cast<uint8_t>(0 - header - opcode - subtype - state - result);
+  return frame;
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   const std::string test = argv[1];
   YaleXSBLE yale;
   now = test == "wrap" ? UINT32_MAX - 50 : 1000;
+  using Operation = YaleXSBLE::OperationType;
+  using Step = YaleXSBLE::StepType;
+  using Progress = YaleXSBLE::MotorProgress;
+  if (test == "motor_sequence") {
+    yale.lock_status_ = YaleLockStatus::SECUREMODE;
+    yale.current_operation_ = Operation::UNLOCK;
+    yale.wait_for(Step::FORCE_UNLOCK);
+    yale.handle_normal_response_(response(0xAA, COMMAND_UNLOCK));
+    assert(yale.motor_progress_ == Progress::ACKNOWLEDGED);
+    assert(!yale.is_expected_complete_());
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x03));
+    yale.handle_normal_response_(response(0xBB, COMMAND_LOCK));
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_DOOR_ONLY, 0x02));
+    assert(yale.lock_status_ == YaleLockStatus::SECUREMODE);
+    assert(yale.door_status_ == YaleDoorStatus::AJAR);
+    assert(yale.active_step_ == Step::FORCE_UNLOCK && yale.run_next_calls == 0);
+    assert(yale.timers.count("command_timeout") == 1 && yale.lock_publications == 0);
+    yale.handle_normal_response_(response(0xBB, COMMAND_UNLOCK));
+    assert(yale.motor_progress_ == Progress::SUCCEEDED && yale.run_next_calls == 1);
+    assert(yale.lock_status_ == YaleLockStatus::SECUREMODE && !yale.is_expected_complete_());
+    yale.lock_status_ = YaleLockStatus::UNLOCKED;
+    assert(!yale.is_expected_complete_());
+
+    yale.build_operation_steps_();
+    assert((yale.steps_ == std::deque<Step>{Step::LOCK_STATUS, Step::DOOR_STATUS}));
+    yale.wait_for(Step::LOCK_STATUS);
+    auto invalid = response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x03);
+    invalid[3]++;
+    yale.handle_normal_response_(invalid);
+    yale.handle_normal_response_(response(0xAA, COMMAND_GETSTATUS, STATUS_LOCK_ONLY));
+    yale.handle_normal_response_(response(0xBB, COMMAND_UNLOCK));
+    assert(yale.active_step_ == Step::LOCK_STATUS && yale.run_next_calls == 1);
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x03));
+    assert(yale.lock_status_ == YaleLockStatus::UNLOCKED && yale.is_expected_complete_());
+    assert(yale.run_next_calls == 2 && yale.lock_publications == 1);
+
+    // Confirm the same cache value on a later request and clear the entity's transition.
+    yale.wait_for(Step::LOCK_STATUS);
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x03));
+    assert(yale.lock_publications == 2);
+    return 0;
+  }
+  if (test == "jam") {
+    yale.current_operation_ = Operation::UNLOCK;
+    yale.wait_for(Step::FORCE_UNLOCK);
+    yale.handle_normal_response_(response(0xAA, COMMAND_UNLOCK));
+    yale.handle_normal_response_(response(0xBB, COMMAND_UNLOCK, 0, 0, 0x1F));
+    assert(yale.lock_status_ == YaleLockStatus::JAMMED && yale.failures == 1);
+    assert(yale.current_operation_ == Operation::NONE && yale.run_next_calls == 0);
+    assert(yale.timers.count("retry") == 0);
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x07));
+    assert(yale.lock_status_ == YaleLockStatus::JAMMED);
+    return 0;
+  }
+  if (test == "ack_timeout") {
+    yale.current_operation_ = Operation::LOCK;
+    yale.wait_for(Step::FORCE_LOCK);
+    yale.handle_normal_response_(response(0xAA, COMMAND_LOCK, 0x04));
+    assert(yale.motor_progress_ == Progress::NONE);
+    yale.handle_normal_response_(response(0xAA, COMMAND_LOCK));
+    assert(yale.motor_progress_ == Progress::ACKNOWLEDGED);
+    yale.handle_command_timeout_();
+    assert(yale.lock_status_ == YaleLockStatus::UNKNOWN && yale.failures == 1);
+    assert(yale.current_operation_ == Operation::NONE && yale.timers.count("retry") == 0);
+    assert((yale.operation_queue_ == std::deque<Operation>{Operation::UPDATE}));
+    return 0;
+  }
+  if (test == "verification_timeout") {
+    yale.current_operation_ = Operation::UNLOCK;
+    yale.current_attempt_ = 1;
+    yale.operation_retries_ = 1;
+    yale.wait_for(Step::FORCE_UNLOCK);
+    yale.handle_normal_response_(response(0xBB, COMMAND_UNLOCK));
+    assert(yale.motor_progress_ == Progress::SUCCEEDED);
+    yale.wait_for(Step::LOCK_STATUS);
+    yale.handle_command_timeout_();
+    assert(yale.timers.count("retry") == 1 && yale.failures == 0);
+    yale.advance(250);
+    assert(yale.current_attempt_ == 2);
+    yale.build_operation_steps_();
+    assert((yale.steps_ == std::deque<Step>{Step::LOCK_STATUS, Step::DOOR_STATUS}));
+    yale.wait_for(Step::LOCK_STATUS);
+    yale.handle_command_timeout_();
+    assert(yale.lock_status_ == YaleLockStatus::UNKNOWN && yale.failures == 1);
+    assert(yale.timers.count("retry") == 0);
+    return 0;
+  }
+  if (test == "poll_matching") {
+    yale.current_operation_ = Operation::UPDATE;
+    yale.wait_for(Step::BATTERY_STATUS);
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_LOCK_ONLY, 0x0C));
+    assert(yale.lock_status_ == YaleLockStatus::SECUREMODE && yale.run_next_calls == 0);
+    yale.handle_normal_response_(response(0xAA, COMMAND_GETSTATUS, STATUS_BATTERY));
+    assert(yale.battery_updates == 0 && yale.timers.count("command_timeout") == 1);
+    yale.handle_normal_response_(response(0xBB, COMMAND_GETSTATUS, STATUS_BATTERY));
+    assert(yale.battery_updates == 1 && yale.run_next_calls == 1);
+    return 0;
+  }
   if (test == "priority") {
     yale.current_operation_ = YaleXSBLE::OperationType::UPDATE;
     yale.session_authenticated_ = true;

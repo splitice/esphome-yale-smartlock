@@ -1,4 +1,4 @@
-"""Run the component's actual retry methods with a fake clock and BLE client.
+"""Run the component's retry and response methods with a fake clock and BLE client.
 
 Only the platform/session helpers are stubbed; method bodies and retry state
 members are extracted from production sources so this catches timer starvation.
@@ -15,11 +15,15 @@ METHODS = (
     "loop", "queue_operation_", "maybe_start_next_operation_", "start_current_attempt_",
     "connect_current_attempt_", "retry_current_operation_",
     "fail_current_operation_", "force_disconnect_", "write_command_",
+    "build_operation_steps_", "matches_normal_response_", "handle_normal_response_",
+    "handle_command_timeout_", "parse_state_response_", "parse_lock_status_",
+    "parse_door_status_", "validate_simple_response_", "update_lock_status_",
+    "is_lock_operation_", "is_expected_complete_", "is_bad_lock_state_",
 )
 
 
 def method(source, name):
-    start = source.index(f"void YaleXSBLE::{name}(")
+    start = re.search(rf"^\w+ YaleXSBLE::{name}\(", source, re.M).start()
     opening = source.index("{", start)
     depth = 1
     end = opening + 1
@@ -36,8 +40,8 @@ class RetryRecoveryTest(unittest.TestCase):
         header = (ROOT / "components/yalexs_ble/yalexs_ble.h").read_text()
         bodies = [method(source, name) for name in METHODS]
         enums = "\n".join(
-            re.search(rf"enum class {name}.*?\n  }};", header, re.S).group()
-            for name in ("OperationType", "StepType", "ResponseChannel")
+            re.search(rf"enum class {name}[^}}]+}};", header).group()
+            for name in ("OperationType", "StepType", "MotorProgress", "ResponseChannel", "NotifySetup")
         )
         state = header[header.index("  std::deque<OperationType> operation_queue_;"):
                        header.index("  YaleLockInfo lock_info_;")]
@@ -48,6 +52,12 @@ class RetryRecoveryTest(unittest.TestCase):
         declarations = "\n".join(body[:body.index("{")].replace("YaleXSBLE::", "") + ";"
                                  for body in bodies)
         fixture = (ROOT / "tests/retry_recovery_fixture.cpp").read_text()
+        protocol = "\n".join(
+            re.search(rf"^enum class {name}.*?\n}};", header, re.M | re.S).group()
+            for name in ("YaleLockStatus", "YaleDoorStatus")
+        )
+        protocol += "\n" + source[source.index("enum YaleCommand"):source.index("bool YaleLockInfo::door_sense()")]
+        fixture = fixture.replace("// PRODUCTION_PROTOCOL", protocol)
         fixture = fixture.replace("// PRODUCTION_DECLARATIONS", enums + state + settings + declarations)
         fixture = fixture.replace("// PRODUCTION_METHODS", "\n".join(bodies))
         cls.temp = tempfile.TemporaryDirectory()
@@ -90,3 +100,18 @@ class RetryRecoveryTest(unittest.TestCase):
 
     def test_cached_connection_uses_fast_setup_parameters(self):
         self.run_case("aggressive")
+
+    def test_unlock_waits_for_motor_result_and_lock_status(self):
+        self.run_case("motor_sequence")
+
+    def test_confirmed_jam_is_terminal(self):
+        self.run_case("jam")
+
+    def test_acknowledged_command_is_not_replayed_after_result_timeout(self):
+        self.run_case("ack_timeout")
+
+    def test_background_poll_ignores_other_status_frames(self):
+        self.run_case("poll_matching")
+
+    def test_lost_verification_refreshes_without_replaying_motor(self):
+        self.run_case("verification_timeout")

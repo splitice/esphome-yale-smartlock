@@ -58,8 +58,8 @@ enum class YaleLockStatus : uint8_t {
   LOCKING = 0x04,
   LOCKED = 0x05,
   UNKNOWN_06 = 0x06,
+  JAMMED = 0x07,
   SECUREMODE = 0x0C,
-  JAMMED = 0x1B,
 };
 
 enum class YaleDoorStatus : uint8_t {
@@ -110,6 +110,7 @@ class YaleXSBLE : public Component,
   void set_lock(YaleXSBLELock *lock) { this->lock_entity_ = lock; }
   void set_refresh_button(YaleXSBLERefreshButton *button) { this->refresh_button_ = button; }
   void set_door_binary_sensor(binary_sensor::BinarySensor *sensor) { this->door_binary_sensor_ = sensor; }
+  void set_lock_status_text_sensor(text_sensor::TextSensor *sensor) { this->lock_status_sensor_ = sensor; }
   void set_door_status_text_sensor(text_sensor::TextSensor *sensor) { this->door_status_sensor_ = sensor; }
   void set_last_seen_broadcast_text_sensor(text_sensor::TextSensor *sensor) { this->last_seen_broadcast_sensor_ = sensor; }
   void set_battery_level_sensor(sensor::Sensor *sensor) { this->battery_level_sensor_ = sensor; }
@@ -145,6 +146,8 @@ class YaleXSBLE : public Component,
     FORCE_UNLOCK,
     SHUTDOWN,
   };
+
+  enum class MotorProgress : uint8_t { NONE, ACKNOWLEDGED, SUCCEEDED };
 
   enum class ResponseChannel : uint8_t {
     NONE,
@@ -233,8 +236,8 @@ class YaleXSBLE : public Component,
                           const char *name);
 
   void handle_secure_response_(std::vector<uint8_t> encrypted, std::vector<uint8_t> decrypted);
-  void handle_normal_response_(std::vector<uint8_t> decrypted);
-  void handle_unsolicited_normal_(const std::vector<uint8_t> &decrypted);
+  void handle_normal_response_(const std::vector<uint8_t> &response);
+  bool matches_normal_response_(const std::vector<uint8_t> &response) const;
   void handle_command_timeout_();
 
   std::vector<uint8_t> build_secure_command_(uint8_t opcode, const uint8_t *payload, uint8_t payload_len);
@@ -250,8 +253,7 @@ class YaleXSBLE : public Component,
   static bool validate_simple_response_(const std::vector<uint8_t> &response);
   static bool validate_secure_response_(const std::vector<uint8_t> &response);
 
-  void parse_state_response_(const std::vector<uint8_t> &response);
-  void parse_lock_and_door_state_(const std::vector<uint8_t> &response);
+  void parse_state_response_(const std::vector<uint8_t> &response, bool publish_lock);
   YaleLockStatus parse_lock_status_(uint8_t value) const;
   YaleDoorStatus parse_door_status_(uint8_t value) const;
   YaleBatteryState parse_battery_state_(const std::vector<uint8_t> &response) const;
@@ -263,6 +265,7 @@ class YaleXSBLE : public Component,
   void publish_door_state_();
   void publish_battery_state_();
 
+  bool is_lock_operation_() const;
   bool is_expected_complete_() const;
   bool is_bad_lock_state_(YaleLockStatus status) const;
   bool is_jammed_state_(YaleLockStatus status) const;
@@ -276,6 +279,7 @@ class YaleXSBLE : public Component,
   YaleXSBLELock *lock_entity_{nullptr};
   YaleXSBLERefreshButton *refresh_button_{nullptr};
   binary_sensor::BinarySensor *door_binary_sensor_{nullptr};
+  text_sensor::TextSensor *lock_status_sensor_{nullptr};
   text_sensor::TextSensor *door_status_sensor_{nullptr};
   text_sensor::TextSensor *last_seen_broadcast_sensor_{nullptr};
   sensor::Sensor *battery_level_sensor_{nullptr};
@@ -323,6 +327,8 @@ class YaleXSBLE : public Component,
   std::deque<OperationType> operation_queue_;
   std::deque<StepType> steps_;
   OperationType current_operation_{OperationType::NONE};
+  MotorProgress motor_progress_{MotorProgress::NONE};
+  bool lock_status_confirmed_{false};
   uint8_t current_attempt_{0};
   uint32_t operation_started_ms_{0};
   bool retry_pending_{false};
@@ -340,7 +346,6 @@ class YaleXSBLE : public Component,
   YaleBatteryState battery_;
   YaleLockStatus lock_status_{YaleLockStatus::UNKNOWN};
   YaleDoorStatus door_status_{YaleDoorStatus::UNKNOWN};
-  bool lock_seen_this_session_{false};
   bool door_seen_this_session_{false};
   bool battery_seen_this_session_{false};
 

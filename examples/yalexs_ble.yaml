@@ -38,6 +38,8 @@ yalexs_ble:
 
   lock:
     name: Front Door Lock
+  lock_status:
+    name: Front Door Lock Status
   refresh_door_status:
     name: Front Door Refresh Door Status
   door:

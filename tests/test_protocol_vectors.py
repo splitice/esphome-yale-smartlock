@@ -157,7 +157,7 @@ class ProtocolVectorTest(unittest.TestCase):
             0x05: "locked",
             0x06: "unknown_06",
             0x0C: "securemode",
-            0x1B: "jammed",
+            0x07: "jammed",
         }
         door_status = {
             0x00: "unknown",
@@ -167,7 +167,7 @@ class ProtocolVectorTest(unittest.TestCase):
             0x04: "unknown_04",
         }
         self.assertEqual(lock_status.get(0xFF, "unknown"), "unknown")
-        self.assertEqual(lock_status[0x1B], "jammed")
+        self.assertEqual(lock_status[0x07], "jammed")
         self.assertEqual(door_status[0x02], "ajar")
         self.assertIsNone({"opened": True, "closed": False}.get(door_status[0x04]))
 

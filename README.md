@@ -7,6 +7,7 @@ the upstream `yalexs-ble==3.2.4` Python package.
 This initial version uses manual credentials in YAML and exposes:
 
 - Lock/unlock
+- Optional lock status text that distinguishes `locked`, `securemode`, and `jammed`
 - Door binary state and detailed door status text
 - Refresh door status button
 - Last seen BLE broadcast text
@@ -39,6 +40,8 @@ yalexs_ble:
 
   lock:
     name: Front Door Lock
+  lock_status:
+    name: Front Door Lock Status
   refresh_door_status:
     name: Front Door Refresh Door Status
   door:
